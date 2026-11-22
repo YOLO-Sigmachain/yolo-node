@@ -2660,7 +2660,11 @@ components:
       description: Emission info for height
       type: object
       properties:
+        height:
+          type: integer
+          format: int32
         minerReward:
+          description: Miner reward at this height. On the YOLO chain, the miner share (93%) of the emission spend
           type: integer
           format: int64
         totalCoinsIssued:
@@ -2670,6 +2674,19 @@ components:
           type: integer
           format: int64
         reemitted:
+          description: Re-emission amount at this height (EIP-27). Always 0 on the YOLO chain
+          type: integer
+          format: int64
+        treasuryReward:
+          description: YOLO chain only, treasury share of the emission spend at this height
+          type: integer
+          format: int64
+        lpReward:
+          description: YOLO chain only, LP share of the emission spend at this height
+          type: integer
+          format: int64
+        blockReward:
+          description: YOLO chain only, minerReward + treasuryReward + lpReward
           type: integer
           format: int64
 
@@ -2680,8 +2697,22 @@ components:
         emission:
           type: string
         reemission:
+          description: Ergo chain only (absent on a YOLO chain)
           type: string
         pay2Reemission:
+          description: Ergo chain only (absent on a YOLO chain)
+          type: string
+        treasuryAccumulation:
+          description: YOLO chain only, treasury accumulation contract
+          type: string
+        lpAccumulation:
+          description: YOLO chain only, LP accumulation contract
+          type: string
+        treasuryFund:
+          description: YOLO chain only, treasury fund contract
+          type: string
+        lpFund:
+          description: YOLO chain only, LP fund contract
           type: string
 
     BalancesSnapshot:
