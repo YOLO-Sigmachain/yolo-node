@@ -1,3 +1,28 @@
+# YOLO node
+
+This is the YOLO SigmaChain fork of [Ergo](https://github.com/ergoplatform/ergo).
+
+- **Starts from:** upstream commit `c1a69f65df2228ce26b7d1c2360b472ef79fc55c`, tag `v6.0.8`.
+- **What changes:**
+  - A YOLO switch, `ergo.chain.yolo.enabled`, which is off by default, and two settings files for the YOLO test networks, `yolo-testnet.conf` and `yolo-devnet.conf`.
+  - 30 second blocks, with difficulty retargeting every 64 blocks from genesis (the first retarget is at block 129), and a mining table height of block height divided by 4.
+  - A block header may be at most 4 block intervals, 2 minutes, ahead of the node's clock. Ergo allows 10 block intervals.
+  - Its own emission, in which each block reward is split 93 / 4 / 3 between the miner, a treasury fund and a liquidity fund, with three genesis boxes for the emission and the two funds.
+  - The miner's share of each block reward is locked for 2,880 blocks.
+  - Block assembly and mempool policy (not chain rules): a pool transaction is held to the cost the node recorded for it, one that does not fit is passed over without stopping assembly, and one that costs more than recorded at assembly, or fails there, is removed and the boxes it spends are refused at admission until they are spent in a block, unless the spending transaction also brings a plain key-signed box of its own (a P2PK box with its signature). Protocol builders whose bots spend shared contract boxes with no signature should add a plain key-signed box while such a box is refused. Details in `yolo-testnet.conf`.
+- **General fixes included, not tied to the YOLO switch:** reject a late mining solution instead of failing; do not fail at start when history has exactly one header; announce a locally mined block when its sections are stored; keep one connection when two nodes dial each other at the same moment; apply the storage rent filter to transactions returned from rolled back blocks.
+- **Two changes that also apply when the YOLO switch is off.** A node built from this fork and run as a plain Ergo node differs from upstream `v6.0.8` in these two ways:
+  - **Storage rent attestation, validation rule 308 (EIP-0052).** The rule and the code for it are present. On an Ergo network it applies only to blocks of version 5 or higher. Ergo blocks are version 4 today, so it has no effect unless the Ergo network moves to block version 5. With the YOLO switch on it applies from the first block.
+  - **Extra index.** The optional extra index (`ergo.node.extraIndex = true`) also covers the genesis boxes and their tokens. The index version goes from 7 to 8, so a node with an existing extra index rebuilds it once on first start. Nodes that do not use the extra index are not affected.
+- **Compare with upstream:** Every change is in the commits after the starting commit above. GitHub's compare view against the upstream project shows them.
+- **Licence:** CC0 1.0 Universal, in the `LICENSE` file, unchanged from upstream.
+
+---
+
+## Upstream README
+
+Everything below is the README of the Ergo node, kept as upstream wrote it. It describes the upstream project, not this fork.
+
 *The World still needs for better money. Join us in this quest.* 
 
 # Ergo
@@ -29,7 +54,7 @@ More papers can be found at [docs.ergoplatform.com/documents](https://docs.ergop
 The Ergo client operates under certain assumptions about its environment:
 
 * The execution environment is trusted. Although the seed is stored in an encrypted file, and the client's wallet attempts to purge the secret key from memory as soon as it is no longer needed, the client does not have defenses against side-channel attacks, memory scans, etc.
-* Clocks are expected to be synchronized to a reasonable degree. If a block's timestamp is more than 20 minutes into the future, the block will be temporarily rejected. The client does not utilize NTP or other time synchronization protocols.
+* Clocks are expected to be synchronized to a reasonable degree. If a block's timestamp is more than 20 minutes into the future (2 minutes with the YOLO switch on), the block will be temporarily rejected. The client does not utilize NTP or other time synchronization protocols.
 
 ## Building and Running the Node and UI
 
@@ -70,7 +95,6 @@ ergo {
 }
 ```
 
-
 For more detailed information on different modes of node operation, please visit [docs.ergoplatform.com/node/modes](https://docs.ergoplatform.com/node/modes).
 
 ## Testing Procedures
@@ -106,4 +130,3 @@ Ergo is an open-source project and we welcome contributions from developers and 
 ## Frequently Asked Questions
 
 For common queries, please refer to our [Frequently Asked Questions](FAQ.md) page.
-
