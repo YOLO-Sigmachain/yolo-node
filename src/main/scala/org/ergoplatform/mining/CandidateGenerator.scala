@@ -8,7 +8,7 @@ import org.ergoplatform.mining.AutolykosPowScheme.derivedHeaderFields
 import org.ergoplatform.mining.difficulty.DifficultySerializer
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history._
-import org.ergoplatform.modifiers.history.extension.Extension
+import org.ergoplatform.modifiers.history.extension.{Extension, ExtensionCandidate}
 import org.ergoplatform.modifiers.history.header.{Header, HeaderWithoutPow}
 import org.ergoplatform.modifiers.history.popow.NipopowAlgos
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
@@ -441,6 +441,39 @@ object CandidateGenerator extends ScorexLogging {
   /** Helper which is checking that inputs of the transaction are not spent */
   private def inputsNotSpent(tx: ErgoTransaction, s: UtxoStateReader): Boolean =
     tx.inputs.forall(inp => s.boxById(inp.boxId).isDefined)
+
+  /**
+    * Ids, in block order, of the transactions in `txs` with at least one storage rent claim input in a block at
+    * `height` (see `ErgoTransaction.hasStorageRentClaim`): the set C of rule `bsStorageRentAttestation`.
+    * Input boxes are resolved as `UtxoState.applyTransactions` resolves them, among the outputs of `txs` first, then
+    * in the UTXO set `s`. A transaction with an input resolved in neither is not counted (the block would be invalid).
+    */
+  def storageRentClaimTxIds(txs: Seq[ErgoTransaction], s: UtxoStateReader, height: Int): Seq[ModifierId] = {
+    val createdOutputs = txs.flatMap(_.outputs).map(o => bytesToId(o.id) -> o).toMap
+    txs.filter { tx =>
+      val boxes = tx.inputs.flatMap(inp => createdOutputs.get(bytesToId(inp.boxId)).orElse(s.boxById(inp.boxId)))
+      boxes.length == tx.inputs.length && ErgoTransaction.hasStorageRentClaim(tx, boxes, height)
+    }.map(_.id)
+  }
+
+  /**
+    * Extension fields a block producer adds for rule `bsStorageRentAttestation` to a block with transactions `txs`
+    * (in block order) and upcoming state context `upcomingContext`: the field `Extension.storageRentClaimsField`
+    * over the ids of the storage rent claim transactions among `txs` if there is any, and no field if there is none
+    * or the rule does not apply to the block version (`ChainSettings.storageRentAttestationRequired`, the same
+    * check the validator makes: from block version 5 on).
+    */
+  def storageRentAttestation(txs: Seq[ErgoTransaction],
+                             s: UtxoStateReader,
+                             upcomingContext: ErgoStateContext): ExtensionCandidate = {
+    val claimTxIds =
+      if (upcomingContext.chainSettings.storageRentAttestationRequired(upcomingContext.blockVersion)) {
+        storageRentClaimTxIds(txs, s, upcomingContext.currentHeight)
+      } else {
+        Seq.empty
+      }
+    ExtensionCandidate(if (claimTxIds.nonEmpty) Seq(Extension.storageRentClaimsField(claimTxIds)) else Seq.empty)
+  }
   /**
     * Checks that the best full block in the history corresponds to the state.
     * Evaluated via live history storage reads, so re-checking it after candidate assembly
@@ -811,9 +844,13 @@ object CandidateGenerator extends ScorexLogging {
                       adProof: SerializedAdProof,
                       adDigest: ADDigest,
                       eliminate: EliminateTransactions): (Candidate, EliminateTransactions) = {
+        // Rule bsStorageRentAttestation: attest to the storage rent claim transactions of this block, if any.
+        // Every candidate (first pass, retry, emission-only fallback) is built here from its final transactions,
+        // so the attestation covers the miner's own rent claims (rentClaimTxs) and prioritized transactions too.
+        val blockExtension = extensionCandidate ++ storageRentAttestation(blockTxs, state, upcomingContext)
         val candidate = CandidateBlock(
           bestHeaderOpt, version, nBits, adDigest,
-          adProof, blockTxs, timestamp, extensionCandidate, votes
+          adProof, blockTxs, timestamp, blockExtension, votes
         )
         val ext = deriveWorkMessage(candidate)
         log.info(

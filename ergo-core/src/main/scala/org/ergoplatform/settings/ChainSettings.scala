@@ -5,6 +5,7 @@ import org.ergoplatform.ErgoAddressEncoder
 import org.ergoplatform.mining.AutolykosPowScheme
 import org.ergoplatform.mining.difficulty.DifficultySerializer
 import org.ergoplatform.mining.emission.EmissionRules
+import org.ergoplatform.modifiers.history.header.Header
 import scorex.crypto.authds.ADDigest
 import scorex.util.ModifierId
 import scorex.util.encode.Base16
@@ -52,5 +53,13 @@ case class ChainSettings(protocolVersion: Byte,
 
   val initialDifficultyVersion2: BigInt = Base16.decode(voting.version2ActivationDifficultyHex)
     .fold(_ => throw new Error(s"Failed to parse initialDifficultyVersion2 = $initialDifficultyHex"), BigInt(_))
+
+  /**
+    * Whether validation rule 308 (`bsStorageRentAttestation`) applies to a block of version `blockVersion`.
+    * Upstream: from `Header.StorageRentAttestationVersion` on. Used both by the validator (`ErgoState.execTransactions`) and by the
+    * candidate generator (`CandidateGenerator.storageRentAttestation`), so producer and validator agree.
+    */
+  def storageRentAttestationRequired(blockVersion: Byte): Boolean =
+    blockVersion >= Header.StorageRentAttestationVersion
 
 }
