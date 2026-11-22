@@ -588,7 +588,7 @@ object CandidateGenerator extends ScorexLogging {
     * @param header - last mined header
     * @return `true` if the node should vote for soft-fork
     */
-  private def forkOrdered(ergoSettings: ErgoSettings, currentParams: Parameters, header: Header): Boolean = {
+  private[mining] def forkOrdered(ergoSettings: ErgoSettings, currentParams: Parameters, header: Header): Boolean = {
     val nextHeight = header.height + 1
 
     val protocolVersion = ergoSettings.chainSettings.protocolVersion
@@ -605,7 +605,9 @@ object CandidateGenerator extends ScorexLogging {
       .map(_ + votingSettings.votingLength * votingSettings.softForkEpochs)
     val forkVotingAllowed = votingFinishHeight.forall(fh => nextHeight < fh)
 
-    val nextHeightCondition = if (ergoSettings.networkType.isMainNet) {
+    val nextHeightCondition = if (ergoSettings.chainSettings.yolo.enabled) {
+      nextHeight >= ergoSettings.chainSettings.yolo.softForkVotingStartHeight // YOLO voting start height
+    } else if (ergoSettings.networkType.isMainNet) {
       nextHeight >= 1561601 // 6.0 voting starting height, first block of epoch #1525
     } else if(ergoSettings.networkType.isTestNet) {
       nextHeight >= 1548800 // testnet voting start height
@@ -712,7 +714,8 @@ object CandidateGenerator extends ScorexLogging {
           }
         }
         .getOrElse(
-          (interlinksExtension, Array(0: Byte, 0: Byte, 0: Byte), Header.InitialVersion)
+          (interlinksExtension, Array(0: Byte, 0: Byte, 0: Byte),
+            ergoSettings.chainSettings.genesisBlockVersion(stateContext.currentParameters.blockVersion))
         )
 
       val upcomingContext = state.stateContext.upcoming(

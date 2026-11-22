@@ -29,3 +29,17 @@ object DevnetLaunchParameters extends Parameters(height = 0,
 object Devnet60LaunchParameters extends Parameters(height = 0,
   parametersTable = Parameters.DefaultParameters.updated(Parameters.BlockVersion, Header.Interpreter60Version),
   proposedUpdate = ErgoValidationSettingsUpdate.empty)
+
+/**
+  * Parameters corresponding to the genesis block of a YOLO (SigmaChain) network, selected by
+  * `ErgoSettings.launchParameters` when `ergo.chain.yolo.enabled = true`.
+  *
+  * Same table and rule disables as `TestnetLaunchParameters` (block version 4, rules 215 and 409
+  * disabled), except that the storage fee factor starts at `YoloSettings.StorageFeeFactor` and the maximum block
+  * cost at `YoloSettings.MaxBlockCost`.
+  */
+object YoloLaunchParameters extends Parameters(height = 0,
+  parametersTable = TestnetLaunchParameters.parametersTable
+    .updated(Parameters.StorageFeeFactorIncrease, YoloSettings.StorageFeeFactor)
+    .updated(Parameters.MaxBlockCostIncrease, YoloSettings.MaxBlockCost),
+  proposedUpdate = TestnetLaunchParameters.proposedUpdate)

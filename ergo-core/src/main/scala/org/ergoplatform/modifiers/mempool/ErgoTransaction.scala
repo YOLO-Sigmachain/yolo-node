@@ -428,9 +428,10 @@ case class ErgoTransaction(override val inputs: IndexedSeq[Input],
       )
       // Check that there is no more than one pair of data inputs with the same box id.
       // The rule is applied since ErgoTransaction.DataInputsUniquenessHeight only
+      // (since genesis when the YOLO switch is on, see ChainSettings.dataInputsUniquenessHeight)
       .validate(
         txDataInputsUnique,
-        stateContext.currentHeight < ErgoTransaction.DataInputsUniquenessHeight ||
+        stateContext.currentHeight < stateContext.chainSettings.dataInputsUniquenessHeight ||
           distinctDataInputsSize == dataInputs.size ||
           distinctDataInputsSize + 1 == dataInputs.size,
         InvalidModifier(s"$id: more than one pair of data inputs with the same box", id, modifierTypeId)
@@ -467,7 +468,8 @@ case class ErgoTransaction(override val inputs: IndexedSeq[Input],
     * the check always passes, so historical transactions keep validating.
     */
   private def rentOutputIndicesDistinct(stateContext: ErgoStateContext): Boolean = {
-    if (stateContext.currentHeight < StorageRentDistinctOutputsActivationHeight) {
+    // StorageRentDistinctOutputsActivationHeight, or genesis when the YOLO switch is on
+    if (stateContext.currentHeight < stateContext.chainSettings.storageRentDistinctOutputsActivationHeight) {
       true
     } else {
       val indices = inputs.flatMap { input =>

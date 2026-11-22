@@ -33,7 +33,10 @@ case class ErgoSettings(directory: String,
     * @return blockchain parameters at the genesis block
     */
   def launchParameters: Parameters = {
-    if (networkType == NetworkType.DevNet) {
+    if (chainSettings.yolo.enabled) {
+      // YOLO switch on: YOLO genesis parameters, whatever the network type
+      YoloLaunchParameters
+    } else if (networkType == NetworkType.DevNet) {
       DevnetLaunchParameters
     } else if (networkType == NetworkType.DevNet60) {
       Devnet60LaunchParameters

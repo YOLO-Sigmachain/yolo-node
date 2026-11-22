@@ -6,6 +6,7 @@ import org.ergoplatform.mining.AutolykosPowScheme
 import org.ergoplatform.mining.difficulty.DifficultySerializer
 import org.ergoplatform.mining.emission.EmissionRules
 import org.ergoplatform.modifiers.history.header.Header
+import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import scorex.crypto.authds.ADDigest
 import scorex.util.ModifierId
 import scorex.util.encode.Base16
@@ -32,7 +33,8 @@ case class ChainSettings(protocolVersion: Byte,
                          genesisStateDigestHex: String,
                          initialDifficultyHex: String,
                          makeSnapshotEvery: Int,
-                         genesisId: Option[ModifierId] = None) {
+                         genesisId: Option[ModifierId] = None,
+                         yolo: YoloSettings = YoloSettings.disabled) {
 
   val isMainnet: Boolean = addressPrefix == ErgoAddressEncoder.MainnetNetworkPrefix
 
@@ -55,11 +57,40 @@ case class ChainSettings(protocolVersion: Byte,
     .fold(_ => throw new Error(s"Failed to parse initialDifficultyVersion2 = $initialDifficultyHex"), BigInt(_))
 
   /**
+    * Height since which validation rule 110 (`txDataInputsUnique`) is applied.
+    * Upstream value unless the YOLO switch is on, in which case the rule is active from genesis.
+    */
+  def dataInputsUniquenessHeight: Int =
+    if (yolo.enabled) YoloSettings.DataInputsUniquenessHeight else ErgoTransaction.DataInputsUniquenessHeight
+
+  /**
+    * Height since which validation rule 125 (`txRentDistinctOutputs`) is applied.
+    * Upstream value unless the YOLO switch is on, in which case the rule is active from genesis.
+    */
+  def storageRentDistinctOutputsActivationHeight: Int =
+    if (yolo.enabled) {
+      YoloSettings.StorageRentDistinctOutputsActivationHeight
+    } else {
+      ValidationRules.StorageRentDistinctOutputsActivationHeight
+    }
+
+  /**
     * Whether validation rule 308 (`bsStorageRentAttestation`) applies to a block of version `blockVersion`.
     * Upstream: from `Header.StorageRentAttestationVersion` on. Used both by the validator (`ErgoState.execTransactions`) and by the
     * candidate generator (`CandidateGenerator.storageRentAttestation`), so producer and validator agree.
     */
   def storageRentAttestationRequired(blockVersion: Byte): Boolean =
     blockVersion >= Header.StorageRentAttestationVersion
+
+  /**
+    * Header version of the genesis block. Upstream: `Header.InitialVersion` (1), so the genesis header is solved
+    * with Autolykos v1, which only the node's internal miner supports. With the YOLO switch on, the genesis block
+    * has the block version of the launch parameters, as every block after it, so the whole chain is Autolykos v2
+    * and the genesis work message for external miners carries the PoW height.
+    *
+    * @param launchBlockVersion - block version of the launch parameters
+    */
+  def genesisBlockVersion(launchBlockVersion: Byte): Byte =
+    if (yolo.enabled) launchBlockVersion else Header.InitialVersion
 
 }

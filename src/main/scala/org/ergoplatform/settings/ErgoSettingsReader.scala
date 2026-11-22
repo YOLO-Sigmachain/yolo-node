@@ -13,6 +13,7 @@ import scorex.util.ScorexLogging
 import org.ergoplatform.settings.ErgoSettings.{configPath, scorexConfigPath}
 
 import java.net.{InetAddress, URL}
+import scala.collection.JavaConverters._
 import scala.util.Try
 
 /**
@@ -28,6 +29,27 @@ object ErgoSettingsReader extends ScorexLogging
   }
 
   def fromConfig(config: Config, desiredNetworkTypeOpt: Option[NetworkType] = None): ErgoSettings = {
+    val settings = settingsFromConfig(config)
+    val nodeSettings = settings.nodeSettings
+
+    overrideLogLevel(settings.scorexSettings.logging.level)
+
+    if (nodeSettings.stateType == Digest && nodeSettings.mining) {
+      log.error("Malformed configuration file was provided! Mining is not possible with digest state. Aborting!")
+      ErgoApp.forceStopApplication()
+    }
+
+    // ficus ignores unknown keys, so a misspelt YOLO key (e.g. `enable = true`) would silently read as its default
+    unknownYoloKeysError(config).foreach(failWithError)
+
+    consistentSettings(settings, desiredNetworkTypeOpt)
+  }
+
+  /**
+    * Settings as read from `config`, with none of the start-up checks of `fromConfig` (which stops the
+    * application on a failed check).
+    */
+  private def settingsFromConfig(config: Config): ErgoSettings = {
     val directory = config.as[String](s"$configPath.directory")
     val networkTypeName = config.as[String](s"$configPath.networkType")
     val networkType = NetworkType.fromString(networkTypeName)
@@ -39,27 +61,23 @@ object ErgoSettingsReader extends ScorexLogging
     val scorexSettings = config.as[ScorexSettings](scorexConfigPath)
     val votingTargets = VotingTargets.fromConfig(config)
 
-    overrideLogLevel(scorexSettings.logging.level)
-
-    if (nodeSettings.stateType == Digest && nodeSettings.mining) {
-      log.error("Malformed configuration file was provided! Mining is not possible with digest state. Aborting!")
-      ErgoApp.forceStopApplication()
-    }
-
-    consistentSettings(
-      ErgoSettings(
-        directory,
-        networkType,
-        chainSettings,
-        nodeSettings,
-        scorexSettings,
-        walletSettings,
-        cacheSettings,
-        votingTargets
-      ),
-      desiredNetworkTypeOpt
+    ErgoSettings(
+      directory,
+      networkType,
+      chainSettings,
+      nodeSettings,
+      scorexSettings,
+      walletSettings,
+      cacheSettings,
+      votingTargets
     )
   }
+
+  /**
+    * Reads settings as `read` does but without the start-up checks, so that a test can inspect a config the node
+    * refuses to start on (e.g. `yolo-testnet.conf`, whose emission inputs are unset) instead of the JVM exiting.
+    */
+  protected[settings] def readUnchecked(args: Args): ErgoSettings = settingsFromConfig(readConfig(args))
 
   // Helper method to read user-provided `configFile` with network-specific `fallbackConfig`
   // to be used for default fallback values before reference.conf (which is the last resort)
@@ -167,6 +185,50 @@ object ErgoSettingsReader extends ScorexLogging
         inetAddress.isSiteLocalAddress
     }.getOrElse(false)
 
+  /** Keys allowed in `ergo.chain.yolo` (the fields of `YoloSettings`). */
+  private val YoloConfigKeys: Set[String] = Set("enabled", "softForkVotingStartHeight")
+
+  /**
+    * Unknown keys in the `ergo.chain.yolo` block.
+    *
+    * @return error message naming the unknown keys, or None if there are none (or the block is absent)
+    */
+  protected[settings] def unknownYoloKeysError(config: Config): Option[String] = {
+    val yoloPath = s"$configPath.chain.yolo"
+    if (!config.hasPath(yoloPath)) {
+      None
+    } else {
+      val yoloCfg = config.getConfig(yoloPath)
+      def unknown(cfg: Config, allowed: Set[String], prefix: String): Seq[String] =
+        cfg.root().keySet().asScala.toSeq.sorted.filterNot(allowed.contains).map(k => s"$prefix.$k")
+      val all = unknown(yoloCfg, YoloConfigKeys, yoloPath)
+      if (all.isEmpty) {
+        None
+      } else {
+        Some(s"unknown key(s) ${all.mkString(", ")}; allowed in $yoloPath: ${YoloConfigKeys.toSeq.sorted.mkString(", ")}")
+      }
+    }
+  }
+
+  /**
+    * YOLO start-up check: the YOLO switch and the network must agree.
+    *
+    * @return error message, or None if the settings are consistent
+    */
+  protected[settings] def yoloSettingsError(settings: ErgoSettings): Option[String] = {
+    val chain = settings.chainSettings
+    val yoloOn = chain.yolo.enabled
+    if (yoloOn && settings.networkType != NetworkType.TestNet) {
+      Some("ergo.chain.yolo.enabled = true requires networkType = `testnet`, " +
+        s"but networkType is `${settings.networkType.verboseName}`")
+    } else if (yoloOn && chain.isMainnet) {
+      Some(s"ergo.chain.yolo.enabled = true with ergo.chain.addressPrefix = ${chain.addressPrefix}, " +
+        "the Ergo mainnet address prefix; a YOLO node must not use it")
+    } else {
+      None
+    }
+  }
+
   private def consistentSettings(settings: ErgoSettings,
                                  desiredNetworkTypeOpt: Option[NetworkType]): ErgoSettings = {
     val nodeSettings = settings.nodeSettings
@@ -198,6 +260,8 @@ object ErgoSettingsReader extends ScorexLogging
         "nodeSettings.utxoBootstrap is set or nodeSettings.blocksToKeep >=0")
     } else if (nodeSettings.nipopowSettings.nipopowBootstrap && settings.chainSettings.genesisId.isEmpty) {
       failWithError("nodeSettings.popowBootstrap is set but genesisId is not")
+    } else if (yoloSettingsError(settings).isDefined) {
+      failWithError(yoloSettingsError(settings).get)
     } else {
       settings
     }
