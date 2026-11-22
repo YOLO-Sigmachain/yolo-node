@@ -5,7 +5,7 @@ import akka.io.Tcp
 import akka.testkit.{TestActorRef, TestProbe}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.DisconnectedPeer
 import org.ergoplatform.network.message.MessageConstants.MessageCode
-import org.ergoplatform.network.peer.PeerInfo
+import org.ergoplatform.network.peer.{PeerInfo, SessionIdPeerFeature}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.scalacheck.Gen
 import scorex.core.app.ScorexContext
@@ -527,6 +527,146 @@ class NetworkControllerSpec extends ErgoCorePropertyTest {
 
       val outgoingAddress = new InetSocketAddress("8.8.8.8", 8001)
       f.establishOutgoingConnection(controller, peerManagerProbe, tcpManagerProbe, outgoingAddress)
+    }
+  }
+
+  // ============================================================================
+  // MUTUAL DIAL (two nodes that dial each other at the same moment)
+  // ============================================================================
+
+  property("mutual dial tie-break: both nodes keep the same connection") {
+    forAll { (a: Long, b: Long) =>
+      whenever(a != b) {
+        // node A sees its own dial as Outgoing and B's dial as Incoming; node B sees the reverse
+        val aKeepsItsDial = NetworkController.keepNewOfMutualDial(a, b, Outgoing, Incoming)
+        val aKeepsPeersDial = NetworkController.keepNewOfMutualDial(a, b, Incoming, Outgoing)
+        val bKeepsItsDial = NetworkController.keepNewOfMutualDial(b, a, Outgoing, Incoming)
+        val bKeepsPeersDial = NetworkController.keepNewOfMutualDial(b, a, Incoming, Outgoing)
+        aKeepsItsDial shouldBe (a < b)
+        aKeepsItsDial should not be aKeepsPeersDial // exactly one of the two is preferred on a node
+        aKeepsItsDial shouldBe bKeepsPeersDial // A's dial: both keep it or both close it
+        aKeepsPeersDial shouldBe bKeepsItsDial // B's dial: both keep it or both close it
+      }
+    }
+  }
+
+  property("mutual dial tie-break: same direction or equal session ids keep the existing connection") {
+    forAll { (a: Long, b: Long) =>
+      NetworkController.keepNewOfMutualDial(a, b, Outgoing, Outgoing) shouldBe false
+      NetworkController.keepNewOfMutualDial(a, b, Incoming, Incoming) shouldBe false
+      NetworkController.keepNewOfMutualDial(a, a, Outgoing, Incoming) shouldBe false
+      NetworkController.keepNewOfMutualDial(a, a, Incoming, Outgoing) shouldBe false
+    }
+  }
+
+  /** Sets up an outgoing and an incoming connection to one peer; returns (outgoing, incoming, peer handshake info) */
+  private def mutualDial(f: ControllerFixture,
+                         controller: TestActorRef[NetworkController],
+                         peerManagerProbe: TestProbe,
+                         tcpManagerProbe: TestProbe,
+                         peerSessionId: Long): (f.EstablishedConnection, f.EstablishedConnection, PeerInfo) = {
+    val declared = new InetSocketAddress("203.0.113.50", 9030)
+    val ephemeral = new InetSocketAddress("203.0.113.50", 51000)
+    val magic = settings.scorexSettings.network.magicBytes
+    val peerInfo = PeerInfo(
+      defaultPeerSpec.copy(declaredAddress = Some(declared), features = Seq(SessionIdPeerFeature(magic, peerSessionId))),
+      System.currentTimeMillis())
+
+    controller ! NetworkController.ReceivableMessages.ConnectTo(peerInfo)
+    tcpManagerProbe.expectMsgType[Tcp.Connect]
+    val outProbe = TestProbe("OutgoingConnection")(f.system)
+    outProbe.send(controller, Tcp.Connected(declared, settings.scorexSettings.network.bindAddress))
+    val outHandler = outProbe.expectMsgType[Tcp.Register].handler
+    outProbe.expectMsg(Tcp.ResumeReading)
+    outProbe.expectMsgType[Tcp.Write]
+
+    val incoming = f.establishIncomingConnectionWithHandler(controller, peerManagerProbe, ephemeral)
+    (f.EstablishedConnection(outProbe, outHandler), incoming, peerInfo)
+  }
+
+  property("mutual dial: the node with the lower session id keeps its outgoing connection and the peer record") {
+    withFixture { f =>
+      val (controller, peerManagerProbe, tcpManagerProbe) = f.createController(maxConnections = 30)
+      // the controller's session id is below Long.MaxValue, so its own dial is the one to keep
+      val (outgoing, incoming, peerInfo) = mutualDial(f, controller, peerManagerProbe, tcpManagerProbe, Long.MaxValue)
+
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(peerInfo), incoming.handlerRef)
+      incoming.connectionProbe.expectMsg(Tcp.Abort)
+      outgoing.connectionProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(200.millis) // no RemovePeer
+
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(peerInfo), outgoing.handlerRef)
+      peerManagerProbe.expectMsgType[AddOrUpdatePeer]
+      outgoing.connectionProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(200.millis)
+    }
+  }
+
+  property("mutual dial: the node with the higher session id keeps the incoming connection and closes its own") {
+    withFixture { f =>
+      val (controller, peerManagerProbe, tcpManagerProbe) = f.createController(maxConnections = 30)
+      // the controller's session id is above Long.MinValue, so the peer's dial is the one to keep
+      val (outgoing, incoming, peerInfo) = mutualDial(f, controller, peerManagerProbe, tcpManagerProbe, Long.MinValue)
+
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(peerInfo), incoming.handlerRef)
+      outgoing.connectionProbe.expectMsg(Tcp.Abort)
+      peerManagerProbe.expectMsgType[AddOrUpdatePeer]
+      incoming.connectionProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(200.millis) // no RemovePeer
+    }
+  }
+
+  property("mutual dial: when the outgoing handshake arrives first, the same connection is kept") {
+    withFixture { f =>
+      val (controller, peerManagerProbe, tcpManagerProbe) = f.createController(maxConnections = 30)
+      val (outgoing, incoming, peerInfo) = mutualDial(f, controller, peerManagerProbe, tcpManagerProbe, Long.MinValue)
+
+      // the outgoing connection handshakes first and is accepted, as nothing else is known about the peer yet
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(peerInfo), outgoing.handlerRef)
+      peerManagerProbe.expectMsgType[AddOrUpdatePeer]
+      // then the peer's dial handshakes: it is the preferred one, so it replaces the outgoing connection
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(peerInfo), incoming.handlerRef)
+      outgoing.connectionProbe.expectMsg(Tcp.Abort)
+      peerManagerProbe.expectMsgType[AddOrUpdatePeer]
+      incoming.connectionProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(200.millis) // no RemovePeer
+    }
+  }
+
+  property("mutual dial: a connection from another IP that claims a connected peer's address does not replace it") {
+    withFixture { f =>
+      val (controller, peerManagerProbe, tcpManagerProbe) = f.createController(maxConnections = 30)
+      val (outgoing, _, peerInfo) = mutualDial(f, controller, peerManagerProbe, tcpManagerProbe, 7L)
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(peerInfo), outgoing.handlerRef)
+      peerManagerProbe.expectMsgType[AddOrUpdatePeer]
+
+      // a third party on another IP declares the peer's address with the session id that always wins the tie-break
+      val intruder = f.establishIncomingConnectionWithHandler(
+        controller, peerManagerProbe, new InetSocketAddress("198.51.100.77", 40000))
+      val magic = settings.scorexSettings.network.magicBytes
+      val spoofed = peerInfo.copy(peerSpec = peerInfo.peerSpec.copy(features = Seq(SessionIdPeerFeature(magic, Long.MinValue))))
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(spoofed), intruder.handlerRef)
+
+      intruder.connectionProbe.expectMsg(Tcp.Abort)
+      outgoing.connectionProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(200.millis) // the peer record is neither replaced nor removed
+    }
+  }
+
+  property("mutual dial: a connection from the peer's IP with another session id does not replace a handshaked one") {
+    withFixture { f =>
+      val (controller, peerManagerProbe, tcpManagerProbe) = f.createController(maxConnections = 30)
+      val (outgoing, incoming, peerInfo) = mutualDial(f, controller, peerManagerProbe, tcpManagerProbe, 7L)
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(peerInfo), outgoing.handlerRef)
+      peerManagerProbe.expectMsgType[AddOrUpdatePeer]
+
+      val magic = settings.scorexSettings.network.magicBytes
+      val other = peerInfo.copy(peerSpec = peerInfo.peerSpec.copy(features = Seq(SessionIdPeerFeature(magic, Long.MinValue))))
+      controller.tell(NetworkController.ReceivableMessages.Handshaked(other), incoming.handlerRef)
+
+      incoming.connectionProbe.expectMsg(Tcp.Abort)
+      outgoing.connectionProbe.expectNoMessage(200.millis)
+      peerManagerProbe.expectNoMessage(200.millis)
     }
   }
 }

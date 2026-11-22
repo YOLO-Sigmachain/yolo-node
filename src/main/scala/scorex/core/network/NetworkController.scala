@@ -445,18 +445,48 @@ class NetworkController(ergoSettings: ErgoSettings,
       // Drop connection to self if occurred or peer already connected.
       // Decision whether connection is local or is from some other network is made
       // based on SessionIdPeerFeature if exists or in old way using isSelf() function
-      val shouldDrop =
-        connectionForPeerAddress(peerAddress).exists(_.handlerRef != peerHandlerRef) ||
-        peerInfo.peerSpec.features.collectFirst {
-          case SessionIdPeerFeature(networkMagic, sessionId) =>
-            !networkMagic.sameElements(mySessionIdFeature.networkMagic) || sessionId == mySessionIdFeature.sessionId
-        }.getOrElse(isSelf(remoteAddress))
+      val peerSessionOpt = peerInfo.peerSpec.features.collectFirst { case f: SessionIdPeerFeature => f }
+      val selfOrForeign = peerSessionOpt.map { f =>
+        !f.networkMagic.sameElements(mySessionIdFeature.networkMagic) || f.sessionId == mySessionIdFeature.sessionId
+      }.getOrElse(isSelf(remoteAddress))
+      // another connection to the same peer, if any
+      val duplicateOpt = connections.values.find { other =>
+        other.handlerRef != peerHandlerRef &&
+          (other.connectionId.remoteAddress == peerAddress ||
+            other.peerInfo.exists(info => getPeerAddress(info).contains(peerAddress)))
+      }
 
-      if (shouldDrop) {
+      // Two nodes that dial each other at the same moment each hold an outgoing and an incoming connection to
+      // the other. Both sides keep the same one: the connection opened by the node with the lower session id.
+      // The existing connection is replaced only if both connections come from the same IP and, when the existing
+      // one has handshaked, carry the same session id. A handshake's declared address is not verified, so without
+      // this a third party claiming a peer's address could close the live connection to that peer.
+      val replaceDuplicate = !selfOrForeign && duplicateOpt.exists { other =>
+        peerSessionOpt.exists { f =>
+          val sameIp = other.connectionId.remoteAddress.getAddress == connectedPeer.connectionId.remoteAddress.getAddress
+          val sameSession = other.peerInfo.forall { info =>
+            info.peerSpec.features.collectFirst { case o: SessionIdPeerFeature => o.sessionId }.contains(f.sessionId)
+          }
+          sameIp && sameSession && NetworkController.keepNewOfMutualDial(
+            mySessionIdFeature.sessionId, f.sessionId, connectedPeer.connectionId.direction, other.connectionId.direction)
+        }
+      }
+
+      if (selfOrForeign) {
         connectedPeer.handlerRef ! CloseConnection
         peerManagerRef ! RemovePeer(peerAddress)
         connections -= connectedPeer.connectionId.remoteAddress
+      } else if (duplicateOpt.nonEmpty && !replaceDuplicate) {
+        // the peer is already connected: close this connection, keep the peer in the peer database
+        log.info(s"Closing duplicate connection ${connectedPeer.connectionId} to $peerAddress")
+        connectedPeer.handlerRef ! CloseConnection
+        connections -= connectedPeer.connectionId.remoteAddress
       } else {
+        // on a mutual dial, the other connection is closed; its entry is removed when its handler terminates
+        duplicateOpt.foreach { other =>
+          log.info(s"Mutual dial with $peerAddress: keeping ${connectedPeer.connectionId}, closing ${other.connectionId}")
+          other.handlerRef ! CloseConnection
+        }
         val newPeerInfo = peerInfo.copy(lastStoredActivityTime = time())
         peerManagerRef ! AddOrUpdatePeer(newPeerInfo)
 
@@ -588,6 +618,22 @@ class NetworkController(ergoSettings: ErgoSettings,
 object NetworkController {
 
   val OutgoingConnections = 8
+
+  /**
+    * Tie-break for two connections to the same peer, used when a handshake arrives on `newDirection` while a
+    * connection with `existingDirection` to that peer is already held. When the two have opposite directions
+    * (both nodes dialed each other), the connection opened by the node with the lower session id is kept, a rule
+    * both nodes evaluate to the same connection. In every other case the existing connection is kept.
+    *
+    * @return true if the new connection is to be kept and the existing one closed
+    */
+  def keepNewOfMutualDial(mySessionId: Long,
+                          peerSessionId: Long,
+                          newDirection: ConnectionDirection,
+                          existingDirection: ConnectionDirection): Boolean = {
+    newDirection != existingDirection && mySessionId != peerSessionId &&
+      newDirection.isOutgoing == (mySessionId < peerSessionId)
+  }
 
   val ChildActorHandlingRetriesNr: Int = 10
 
