@@ -1,9 +1,11 @@
 package org.ergoplatform.nodeView.wallet
 
 import com.google.common.hash.{BloomFilter, Funnels}
+import org.ergoplatform.mining.YoloEmissionTx
 import org.ergoplatform.sdk.wallet.secrets.ExtendedPublicKey
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.{ErgoAddressEncoder, ErgoTreePredef, P2PKAddress}
+import scorex.util.encode.Base16
 import sigma.ast.ErgoTree
 import sigmastate.eval._
 
@@ -30,6 +32,18 @@ final case class WalletCache(publicKeyAddresses: Seq[P2PKAddress],
 
   val miningScriptsBytes: Seq[Array[Byte]] = miningScripts.map(_.bytes)
 
+  /**
+    * Maturity delay of each mining script, by hex of the script bytes (`WalletCache.miningScriptDelays`); empty if
+    * mining rewards are not tracked.
+    */
+  val miningScriptDelays: Map[String, Int] = {
+    if (settings.nodeSettings.mining) {
+      WalletCache.miningScriptDelays(trackedPubKeys, settings)
+    } else {
+      Map.empty
+    }
+  }
+
   def withNewPubkey(newPk: ExtendedPublicKey): Try[WalletCache] = Try {
     val updAddresses: Seq[P2PKAddress] = publicKeyAddresses :+ P2PKAddress(newPk.key)
     val updTrackedPubKeys: Seq[ExtendedPublicKey] = trackedPubKeys :+ newPk
@@ -50,7 +64,26 @@ object WalletCache {
                     settings: ErgoSettings): Seq[ErgoTree] = {
     trackedPubKeys.map { pk =>
       ErgoTreePredef.rewardOutputScript(settings.miningRewardDelay, pk.key)
+    } ++ yoloCoinbaseScripts(trackedPubKeys, settings)
+  }
+
+  // YOLO: the coinbase miner output is at its own delay (YoloEmissionTx.CoinbaseMinerRewardDelay), the fee
+  // output at miningRewardDelay; with the switch off there is no coinbase script
+  private def yoloCoinbaseScripts(trackedPubKeys: Seq[ExtendedPublicKey], settings: ErgoSettings): Seq[ErgoTree] =
+    if (settings.chainSettings.yolo.enabled) trackedPubKeys.map(pk => YoloEmissionTx.minerOutputScript(pk.key)) else Seq.empty
+
+  /**
+    * Maturity delay of each script of `miningScripts`, by hex of the script bytes: `miningRewardDelay` for the fee
+    * script and, with the YOLO switch on, `YoloEmissionTx.CoinbaseMinerRewardDelay` for the coinbase script.
+    */
+  def miningScriptDelays(trackedPubKeys: Seq[ExtendedPublicKey], settings: ErgoSettings): Map[String, Int] = {
+    val fee = trackedPubKeys.map { pk =>
+      Base16.encode(ErgoTreePredef.rewardOutputScript(settings.miningRewardDelay, pk.key).bytes) -> settings.miningRewardDelay
     }
+    val coinbase = yoloCoinbaseScripts(trackedPubKeys, settings).map { s =>
+      Base16.encode(s.bytes) -> YoloEmissionTx.CoinbaseMinerRewardDelay
+    }
+    (fee ++ coinbase).toMap
   }
 
   /**

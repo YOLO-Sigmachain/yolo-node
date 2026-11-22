@@ -123,7 +123,11 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
     }
   }
 
-  protected def emissionBoxIdOpt: Option[ADKey] = store.get(UtxoState.EmissionBoxIdKey).map(s => ADKey @@ s)
+  // YOLO: after the terminal spend an empty id is stored (`UtxoState.metadata`); it means no emission box,
+  // rather than a box to look up and fully search for on every later block
+  protected[state] def emissionBoxIdOpt: Option[ADKey] = store.get(UtxoState.EmissionBoxIdKey)
+    .filter(s => !ergoSettings.chainSettings.yolo.enabled || s.nonEmpty)
+    .map(s => ADKey @@ s)
 
   def emissionBoxOpt: Option[ErgoBox] = emissionBoxIdOpt.flatMap(boxById)
 

@@ -2,8 +2,10 @@ package org.ergoplatform.nodeView.state
 
 import org.ergoplatform.ErgoBox.{R4, R5}
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
-import org.ergoplatform.mining.emission.EmissionRules
+import org.ergoplatform.mining.CandidateGenerator
+import org.ergoplatform.mining.emission.{EmissionRules, YoloEmissionRules}
 import org.ergoplatform.modifiers.ErgoFullBlock
+import org.ergoplatform.modifiers.history.popow.NipopowAlgos
 import org.ergoplatform.modifiers.history.BlockTransactions
 import org.ergoplatform.modifiers.history.extension.Extension
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
@@ -15,6 +17,7 @@ import org.ergoplatform.wallet.utils.TestFileUtils
 import sigma.Colls
 import sigma.ast.ErgoTree
 import sigma.data.Digest32Coll
+import scorex.util.bytesToId
 import sigma.interpreter.ProverResult
 
 import java.io.File
@@ -25,7 +28,8 @@ import java.io.File
   */
 class YoloEmissionTrackingSpec extends ErgoCorePropertyTest with TestFileUtils {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
-  import org.ergoplatform.utils.ErgoCoreTestConstants.parameters
+  import org.ergoplatform.utils.ErgoCoreTestConstants.{defaultMinerPk, defaultMinerSecretNumber, defaultTimestamp,
+    parameters, powScheme}
   import org.ergoplatform.utils.generators.ErgoCoreGenerators._
 
   private lazy val devnetPath: String =
@@ -135,6 +139,71 @@ class YoloEmissionTrackingSpec extends ErgoCorePropertyTest with TestFileUtils {
     found(Seq(token(e.emissionNftIdBytes)), 99999L * EmissionRules.CoinsInOneErgo).map(_.value) shouldBe
       Some(99999L * EmissionRules.CoinsInOneErgo)
     us.closeStorage()
+  }
+
+  /** Mines a block with `txs` on top of `us` (fake PoW) and applies it to the state with `applyModifier`. */
+  private def mine(us: UtxoState, parentOpt: Option[ErgoFullBlock], txs: Seq[ErgoTransaction]): (UtxoState, ErgoFullBlock) = {
+    val (adProof, digest) = us.proofsForTransactions(txs).get
+    val popow = new NipopowAlgos(us.stateContext.chainSettings)
+    val ext = popow.interlinksToExtension(popow.updateInterlinks(parentOpt.map(_.header), parentOpt.map(_.extension)))
+    val time = parentOpt.map(_.header.timestamp + 1).getOrElse(defaultTimestamp)
+    val fb = powScheme.proveBlock(parentOpt.map(_.header), YoloLaunchParameters.blockVersion,
+      devnet.chainSettings.initialNBits, digest, adProof, txs, time, ext, Array.fill(3)(0: Byte),
+      defaultMinerSecretNumber).get
+    us.applyModifier(fb, None)(_ => ()).get -> fb
+  }
+
+  property("across the terminal block (applyModifier): the stored empty id reads as no emission box, also reopened") {
+    // 235 YOLO: heights 1 to 3 pay 75 YOLO each, height 4 is the terminal spend of the last 10 YOLO; height 5 is
+    // after it, paid by a spendable genesis box
+    val s = devnet.copy(chainSettings = devnet.chainSettings.copy(yolo = devnet.chainSettings.yolo.copy(
+      emission = e.copy(genesisValue = 235L * YoloEmissionRules.CoinsInOneYolo))))
+    s.chainSettings.yoloEmissionRulesOpt.get.terminalHeight shouldBe 4L
+    val spendable = new ErgoBoxCandidate(10000000000L, TrueTree, 0).toBox(bytesToId(Array.fill(32)(9: Byte)), 0)
+    val genesis = ErgoState.genesisBoxes(s.chainSettings) :+ spendable
+    val dir = createTempDir
+    var us = UtxoState.fromBoxHolder(BoxHolder(genesis), genesis.headOption, dir, s, YoloLaunchParameters)
+    var parent: Option[ErgoFullBlock] = None
+    (1 to 4).foreach { h =>
+      us.emissionBoxIdOpt shouldBe defined
+      val tx = CandidateGenerator.collectEmission(us, defaultMinerPk, us.stateContext).get
+      tx.outputs.size shouldBe (if (h < 4) 4 else 3)
+      val (next, fb) = mine(us, parent, Seq(tx))
+      us = next
+      parent = Some(fb)
+    }
+    // after the terminal block: an empty id is persisted, and read as no emission box
+    us.stateContext.currentHeight shouldBe 4
+    us.store.get(UtxoState.EmissionBoxIdKey).map(_.length) shouldBe Some(0)
+    us.emissionBoxIdOpt shouldBe None
+    us.emissionBoxOpt shouldBe None
+    CandidateGenerator.collectEmission(us, defaultMinerPk, us.stateContext) shouldBe None
+
+    // a later block (a transfer only) applies and keeps the state at no emission box
+    val transfer = spend(Seq(spendable), new ErgoBoxCandidate(spendable.value, TrueTree, 5))
+    val (after, fb5) = mine(us, parent, Seq(transfer))
+    fb5.header.height shouldBe 5
+    after.extractEmissionBox(fb5) shouldBe None
+    after.store.get(UtxoState.EmissionBoxIdKey).map(_.length) shouldBe Some(0)
+    after.emissionBoxIdOpt shouldBe None
+    after.emissionBoxOpt shouldBe None
+    after.boxById(transfer.outputs.head.id) shouldBe Some(transfer.outputs.head)
+    after.closeStorage()
+
+    // the persisted state, reopened
+    val reopened = UtxoState.create(dir, s)
+    reopened.stateContext.currentHeight shouldBe 5
+    reopened.emissionBoxIdOpt shouldBe None
+    reopened.emissionBoxOpt shouldBe None
+    reopened.closeStorage()
+
+    // switch off: an empty stored id is read as upstream does (Some of an empty id)
+    val off = state(settings.copy(directory = createTempDir.getAbsolutePath), genesisBoxes, None)
+    off.emissionBoxIdOpt.map(_.length) shouldBe Some(0)
+    off.closeStorage()
+    val on = state(devnet, boxes, None)
+    on.emissionBoxIdOpt shouldBe None
+    on.closeStorage()
   }
 
   property("switch off: upstream tracking by the Ergo emission tree, with the 100,000-coin filter") {

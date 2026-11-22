@@ -88,9 +88,10 @@ object WalletScanLogic extends ScorexLogging {
 
     // Resolve boxes related to mining income
     // We choose only boxes which are mature enough to be spent
-    // (i.e. miningRewardDelay blocks passed since a mining reward box mined)
-    val maxMiningHeight = height - walletVars.settings.miningRewardDelay
-    val miningBoxes = registry.unspentBoxes(MiningScanId).filter(_.inclusionHeightOpt.getOrElse(0) <= maxMiningHeight)
+    // (i.e. miningRewardDelay blocks passed since a mining reward box mined; on YOLO the delay of the box's script)
+    val miningBoxes = registry.unspentBoxes(MiningScanId).filter { tb =>
+      tb.inclusionHeightOpt.getOrElse(0) <= height - walletVars.miningRewardDelayOf(tb.box.propositionBytes)
+    }
     val resolvedBoxes = miningBoxes.map { tb =>
       registry.removeScan(tb.box.id, MiningScanId)
       tb.copy(scans = Set(PaymentsScanId))
@@ -206,7 +207,7 @@ object WalletScanLogic extends ScorexLogging {
         val miningIncomeTriggered = miningScriptsBytes.exists(ms => boxScript.sameElements(ms))
 
         val prePaymentStatuses = if (miningIncomeTriggered) {
-          val miningStatus: (ScanId, ScanWalletInteraction.Value) = if (walletVars.settings.miningRewardDelay > 0) {
+          val miningStatus: (ScanId, ScanWalletInteraction.Value) = if (walletVars.miningRewardDelayOf(boxScript) > 0) {
             MiningScanId -> ScanWalletInteraction.Off // scripts are different, so off is kinda overkill
           } else {
             //tweak for tests

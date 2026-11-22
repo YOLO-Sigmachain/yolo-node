@@ -8,10 +8,12 @@ import org.ergoplatform.nodeView.wallet.persistence.{OffChainRegistry, WalletReg
 import org.ergoplatform.nodeView.wallet.scanning.{EqualsScanningPredicate, ScanRequest, ScanWalletInteraction}
 import org.ergoplatform.wallet.Constants
 import org.ergoplatform.wallet.Constants.ScanId
-import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
+import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
+import org.ergoplatform.mining.YoloEmissionTx
 import org.scalacheck.Gen
 import sigma.ast.{ByteArrayConstant, ErgoTree}
 import org.ergoplatform.settings.Constants.{FalseTree, TrueTree}
+import scorex.util.encode.Base16
 
 import scala.util.Random
 
@@ -279,6 +281,64 @@ class WalletScanLogicSpec extends ErgoCorePropertyTest with DBSpec with WalletTe
     boxes.size shouldBe 1
     boxes.head.scans.size shouldBe 2
     boxes.head.scans shouldBe Set(scanId, Constants.PaymentsScanId)
+  }
+
+  property("YOLO: the coinbase output (2880 delay) is mining income released at inclusion + 2880, a fee output at 720") {
+    val yolo = s.copy(chainSettings = s.chainSettings.copy(yolo = s.chainSettings.yolo.copy(enabled = true)))
+    val pk = pubkeys.head.key
+    val coinbaseScript = YoloEmissionTx.minerOutputScript(pk)
+    val feeScript = ErgoTreePredef.rewardOutputScript(720, pk)
+    YoloEmissionTx.CoinbaseMinerRewardDelay shouldBe 2880
+
+    // switch off: the coinbase script is not a mining script, and the fee script keeps the 720 delay
+    val offCache = WalletCache(pubkeys, s)
+    offCache.miningScriptsBytes.exists(_.sameElements(coinbaseScript.bytes)) shouldBe false
+    offCache.miningScriptsBytes.size shouldBe pubkeys.size
+    val offVars = WalletVars(None, Seq.empty, Some(offCache))(s)
+    offVars.miningRewardDelayOf(coinbaseScript.bytes) shouldBe 720
+    val tx = new ErgoTransaction(fakeInputs, IndexedSeq.empty, IndexedSeq(
+      new ErgoBoxCandidate(1000, coinbaseScript, creationHeight = 1), new ErgoBoxCandidate(500, feeScript, creationHeight = 1)))
+    extractWalletOutputs(tx, Some(10), offVars, None).map(_.box.ergoTree) shouldBe Seq(feeScript)
+
+    // switch on: both scripts are mining scripts, each with its own delay
+    val cache = WalletCache(pubkeys, yolo)
+    cache.miningScriptsBytes.exists(_.sameElements(coinbaseScript.bytes)) shouldBe true
+    cache.miningScriptsBytes.exists(_.sameElements(feeScript.bytes)) shouldBe true
+    cache.miningScriptDelays(Base16.encode(coinbaseScript.bytes)) shouldBe 2880
+    cache.miningScriptDelays(Base16.encode(feeScript.bytes)) shouldBe 720
+    val walletVars = WalletVars(None, Seq.empty, Some(cache))(yolo)
+    walletVars.miningRewardDelayOf(coinbaseScript.bytes) shouldBe 2880
+    walletVars.miningRewardDelayOf(feeScript.bytes) shouldBe 720
+    val found = extractWalletOutputs(tx, Some(10), walletVars, None)
+    found.map(_.box.ergoTree) shouldBe Seq(coinbaseScript, feeScript)
+    found.foreach(_.scans shouldBe Set(Constants.MiningScanId))
+
+    withVersionedStore(10) { store =>
+      val inclusion = 10
+      val coinbaseId = tx.outputs.head.id
+      val feeId = tx.outputs(1).id
+      val (r0, o0, f0) = scanBlockTransactions(new WalletRegistry(store)(yolo.walletSettings), OffChainRegistry.empty,
+        walletVars, inclusion, modIdGen.sample.get, Seq(tx), None, None, WalletProfile.User).get
+      r0.unspentBoxes(Constants.MiningScanId).map(_.box.id.toSeq).toSet shouldBe Set(coinbaseId.toSeq, feeId.toSeq)
+      r0.walletUnspentBoxes() shouldBe empty
+
+      var (registry, off, filter) = (r0, o0, f0)
+      // empty blocks at the heights where a box may be released; the payments ids after each
+      def payments(height: Int): Set[Seq[Byte]] = {
+        val (r, o, f) = scanBlockTransactions(registry, off, walletVars, height, modIdGen.sample.get, Seq.empty,
+          Some(filter), None, WalletProfile.User).get
+        registry = r
+        off = o
+        filter = f
+        r.walletUnspentBoxes().map(_.box.id.toSeq).toSet
+      }
+      payments(inclusion + 719) shouldBe empty
+      payments(inclusion + 720) shouldBe Set(feeId.toSeq)
+      payments(inclusion + 2879) shouldBe Set(feeId.toSeq)
+      registry.unspentBoxes(Constants.MiningScanId).map(_.box.id.toSeq) shouldBe Seq(coinbaseId.toSeq)
+      payments(inclusion + 2880) shouldBe Set(feeId.toSeq, coinbaseId.toSeq)
+      registry.unspentBoxes(Constants.MiningScanId) shouldBe empty
+    }
   }
 
 }

@@ -9,6 +9,7 @@ import org.ergoplatform.wallet.Constants.ScanId
 import org.ergoplatform.wallet.interpreter.ErgoProvingInterpreter
 import org.ergoplatform.{ErgoAddressEncoder, P2PKAddress}
 import scorex.util.ScorexLogging
+import scorex.util.encode.Base16
 
 import scala.util.Try
 
@@ -46,6 +47,20 @@ final case class WalletVars(proverOpt: Option[ErgoProvingInterpreter],
   val trackedBytes: Seq[Array[Byte]] = stateCacheOpt.map(_.trackedBytes).getOrElse(Seq.empty)
 
   val miningScriptsBytes: Seq[Array[Byte]] = stateCacheOpt.map(_.miningScriptsBytes).getOrElse(Seq.empty)
+
+  /** Maturity delay of each mining script, by hex of the script bytes (see `WalletCache.miningScriptDelays`). */
+  val miningScriptDelays: Map[String, Int] = stateCacheOpt.map(_.miningScriptDelays).getOrElse(Map.empty)
+
+  /**
+    * Blocks a mining box at `script` must wait after its inclusion before it is released to payments:
+    * `miningRewardDelay`, or with the YOLO switch on the delay of that script (2880 for the coinbase output).
+    */
+  def miningRewardDelayOf(script: Array[Byte]): Int =
+    if (settings.chainSettings.yolo.enabled) {
+      miningScriptDelays.getOrElse(Base16.encode(script), settings.miningRewardDelay)
+    } else {
+      settings.miningRewardDelay
+    }
 
   val scriptsFilter: BloomFilter[Array[Byte]] =
     stateCacheOpt

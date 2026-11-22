@@ -9,7 +9,7 @@ import io.circe.Json
 import org.bouncycastle.util.encoders.Hex
 import org.ergoplatform.http.api.requests.MiningRequest
 import org.ergoplatform.mining.CandidateGenerator.Candidate
-import org.ergoplatform.mining.{AutolykosSolution, CandidateGenerator, ErgoMiner}
+import org.ergoplatform.mining.{AutolykosSolution, CandidateGenerator, ErgoMiner, YoloEmissionTx}
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.wallet.ErgoAddressJsonEncoder
 import org.ergoplatform.settings.{ErgoSettings, RESTApiSettings}
@@ -84,15 +84,23 @@ case class MiningApiRoute(miner: ActorRef,
   }
 
   def rewardAddressR: Route = (path("rewardAddress") & get) {
+    val pkF: Future[ProveDlog] = miner.askWithStatus(ErgoMiner.ReadMinerPk).mapTo[ProveDlog]
     val addressF: Future[ErgoAddress] =
-      miner.askWithStatus(ErgoMiner.ReadMinerPk)
-        .mapTo[ProveDlog]
+      pkF
         .map { pk =>
           val script = ErgoTreePredef.rewardOutputScript(ergoSettings.chainSettings.monetary.minerRewardDelay, pk)
           Pay2SAddress(script)(ergoSettings.addressEncoder)
         }
 
-    ApiResponse(addressF.map(address => Json.obj("rewardAddress" -> address.asJson)))
+    if (ergoSettings.chainSettings.yolo.enabled) {
+      // YOLO: the coinbase miner output is at its own script (2880 delay); rewardAddress stays the fee address
+      ApiResponse(addressF.zip(pkF).map { case (address, pk) =>
+        val coinbase: ErgoAddress = Pay2SAddress(YoloEmissionTx.minerOutputScript(pk))(ergoSettings.addressEncoder)
+        Json.obj("rewardAddress" -> address.asJson, "coinbaseRewardAddress" -> coinbase.asJson)
+      })
+    } else {
+      ApiResponse(addressF.map(address => Json.obj("rewardAddress" -> address.asJson)))
+    }
   }
 
   def rewardPublicKeyR: Route = (path("rewardPublicKey") & get) {

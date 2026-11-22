@@ -253,13 +253,27 @@ class CandidateGenerator(
         }
       val result: StatusReply[Unit] = {
         // None if the solution fits the current candidate not, and there is no previous candidate to try
-        val newBlockOpt: Option[ErgoFullBlock] = state.cachedCandidate
-          .map(candidate => completeBlock(candidate.candidateBlock, solution))
-          .filter(block => ergoSettings.chainSettings.powScheme.validate(block.header).isSuccess)
-          .orElse {
-            log.info(s"Using previous candidate as a solution: " + state.cachedPreviousCandidate)
-            state.cachedPreviousCandidate.map(c => completeBlock(c.candidateBlock, solution))
-          }
+        val newBlockOpt: Option[ErgoFullBlock] = if (ergoSettings.chainSettings.yolo.enabled && CryptoFacade.isInfinityPoint(preSolution.pk)) {
+          // YOLO: the coinbase pays the key the candidate was built for, so the solution gets that candidate's
+          // own key, not the node's: choose the candidate first, then inject its key
+          def withOwnPk(c: Candidate): ErgoFullBlock = completeBlock(c.candidateBlock,
+            AutolykosSolution(c.externalVersion.pk.value, preSolution.w, preSolution.n, preSolution.d))
+          state.cachedCandidate
+            .map(withOwnPk)
+            .filter(block => ergoSettings.chainSettings.powScheme.validate(block.header).isSuccess)
+            .orElse {
+              log.info(s"Using previous candidate as a solution: " + state.cachedPreviousCandidate)
+              state.cachedPreviousCandidate.map(withOwnPk)
+            }
+        } else {
+          state.cachedCandidate
+            .map(candidate => completeBlock(candidate.candidateBlock, solution))
+            .filter(block => ergoSettings.chainSettings.powScheme.validate(block.header).isSuccess)
+            .orElse {
+              log.info(s"Using previous candidate as a solution: " + state.cachedPreviousCandidate)
+              state.cachedPreviousCandidate.map(c => completeBlock(c.candidateBlock, solution))
+            }
+        }
         newBlockOpt match {
           case Some(newBlock) =>
             log.info(s"New block mined, header: ${newBlock.header}")
@@ -814,6 +828,17 @@ object CandidateGenerator extends ScorexLogging {
           upcomingContext,
           emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
         )
+        if (ergoSettings.chainSettings.yolo.enabled) {
+          // YOLO: a block without the coinbase pays no emission; say why, loudly
+          emissionTxOpt.filterNot(etx => res._1.exists(_.id == etx.id)).foreach { etx =>
+            val reason = state.validateWithCost(etx, upcomingContext, state.stateContext.currentParameters.maxBlockCost, None) match {
+              case Failure(e) => s"validation failure: ${e.getMessage}"
+              case Success(_) => "it validates against the state, so block assembly dropped it"
+            }
+            log.error(s"YOLO emission tx ${etx.id} for height ${upcomingContext.currentHeight} is not in the candidate " +
+              s"(eliminated: ${res._2.contains(etx.id)}): $reason")
+          }
+        }
         val rejectedRentClaimTxIds = res._2.filter(id => rentClaimTxs.exists(_.id == id))
         if (rejectedRentClaimTxIds.nonEmpty) {
           val boxIds = rentClaimTxs.filter(tx => rejectedRentClaimTxIds.contains(tx.id))
@@ -889,7 +914,9 @@ object CandidateGenerator extends ScorexLogging {
               emissionTxOpt match {
                 case Some(emissionTx) =>
                   log.error("Failed to produce proofs for transactions, but emission box is found: ", ex)
-                  state.proofsForTransactions(Seq(emissionTx)).map {
+                  yoloFallbackEmissionCheck(ergoSettings, state, emissionTx, upcomingContext).flatMap { _ =>
+                    state.proofsForTransactions(Seq(emissionTx))
+                  }.map {
                     case (adProof, adDigest) =>
                       // Both collections produced failed proofs; their rejections may be stale.
                       mkCandidate(Seq(emissionTx), adProof, adDigest, EliminateTransactions(Seq.empty))
@@ -901,6 +928,28 @@ object CandidateGenerator extends ScorexLogging {
           }
       }
     }.flatten
+
+  /**
+    * Check of the emission tx before an emission-only candidate is made of it (`createCandidate` fallback): with the
+    * YOLO switch on, the tx must pass stateful validation against `upcomingContext` (the emission script binds the
+    * miner output to the candidate's key and height), else a Failure with the validation error. Always a Success with
+    * the switch off, where upstream considers the emission tx valid.
+    */
+  private[mining] def yoloFallbackEmissionCheck(ergoSettings: ErgoSettings,
+                                                state: UtxoStateReader,
+                                                emissionTx: ErgoTransaction,
+                                                upcomingContext: ErgoStateContext): Try[Unit] = {
+    if (ergoSettings.chainSettings.yolo.enabled) {
+      state.validateWithCost(emissionTx, upcomingContext, state.stateContext.currentParameters.maxBlockCost, None) match {
+        case Success(_) => Success(())
+        case Failure(e) =>
+          log.error(s"YOLO emission tx ${emissionTx.id} is invalid, no emission-only candidate: ${e.getMessage}")
+          Failure(e)
+      }
+    } else {
+      Success(())
+    }
+  }
 
   /**
     * Transaction and its cost.
@@ -960,7 +1009,16 @@ object CandidateGenerator extends ScorexLogging {
     val minerProp =
       ErgoTreePredef.rewardOutputScript(emission.settings.minerRewardDelay, minerPk)
 
-    val emissionTxOpt: Option[ErgoTransaction] = emissionBoxOpt.map { emissionBox =>
+    val emissionTxOpt: Option[ErgoTransaction] = if (chainSettings.yolo.enabled) {
+      // YOLO: the emission.es coinbase, coinbase miner output at the 2880 delay; the Ergo curve and the
+      // EIP-27 branches below are not used. `assets` is not paid out, as emission.es allows no token on the miner
+      // output; with no tracked box (emission finished) there is no emission transaction, as upstream
+      emissionBoxOpt.map { emissionBox =>
+        val emissionTx = YoloEmissionTx.build(emissionBox, nextHeight, minerPk, chainSettings.yolo.emission)
+        log.debug(s"YOLO emission tx for nextHeight = $nextHeight: $emissionTx")
+        emissionTx
+      }
+    } else emissionBoxOpt.map { emissionBox =>
       val prop           = emissionBox.ergoTree
       val emissionAmount = emission.minersRewardAtHeight(nextHeight)
 
