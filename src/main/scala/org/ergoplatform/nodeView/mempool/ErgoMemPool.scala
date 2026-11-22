@@ -106,6 +106,24 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     txs.foldLeft(this) { case (acc, tx) => acc.put(tx) }
   }
 
+  /**
+    * Returns transactions of rolled back blocks to the pool. They are put without validation, as
+    * in `put`, but the `rejectStorageRentTxs` mempool policy still applies: with the setting on,
+    * storage rent collection transactions (see `containsStorageRentClaim`) are not returned, so
+    * that a rent claim mined in a block which is rolled back later does not get into the pool
+    * past the policy check done in `process`.
+    *
+    * @param txs - transactions of rolled back blocks, which are not included into new blocks
+    * @return updated pool
+    */
+  def putRolledBack(txs: Seq[UnconfirmedTransaction]): ErgoMemPool = {
+    if (nodeSettings.rejectStorageRentTxs) {
+      put(txs.filterNot(utx => containsStorageRentClaim(utx.transaction)))
+    } else {
+      put(txs)
+    }
+  }
+
   private def updateStatsOnRemoval(tx: ErgoTransaction): MemPoolStatistics = {
     val wtx = pool.transactionsRegistry.get(tx.id)
     wtx.map(wgtx => stats.add(System.currentTimeMillis(), wgtx))

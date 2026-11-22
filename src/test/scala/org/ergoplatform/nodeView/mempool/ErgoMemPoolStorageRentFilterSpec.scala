@@ -193,4 +193,28 @@ class ErgoMemPoolStorageRentFilterSpec extends AnyFlatSpec
     updPool.isInvalidated(tx.id) shouldBe false
   }
 
+  // ------------------------------------------------------------------ (f)
+
+  it should "(f) not return a storage rent claim of a rolled back block to the pool" in {
+    val f = fixture()
+    val claim = rentClaim(f.rentBox)
+    val ordinary = ErgoTransaction(
+      IndexedSeq(Input(f.plainBox.id, ProverResult.empty)),
+      IndexedSeq.empty,
+      IndexedSeq(candidate(f.plainBox.value))
+    )
+    val rolledBack = Seq(claim, ordinary).map(tx => UnconfirmedTransaction(tx, None))
+
+    val updPool = f.pool.putRolledBack(rolledBack)
+    updPool.contains(claim.id) shouldBe false
+    updPool.contains(ordinary.id) shouldBe true
+    updPool.size shouldBe 1
+
+    // With the policy off, both transactions are returned, as before.
+    val off = fixture(filterEnabled = false)
+    val offPool = off.pool.putRolledBack(rolledBack)
+    offPool.contains(claim.id) shouldBe true
+    offPool.contains(ordinary.id) shouldBe true
+  }
+
 }
