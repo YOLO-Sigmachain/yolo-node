@@ -128,18 +128,14 @@ case class BlocksApiRoute(viewHolderRef: ActorRef, readersHolder: ActorRef, ergo
     if (ergoSettings.chainSettings.powScheme.validate(block.header).isSuccess) {
       log.info(s"Received a new valid block through API: ${block.id}")
 
+      // Tell the network layer about the new block BEFORE sending it to the node view holder, so the
+      // announcement of each section (made when the section is stored) can not be missed.
+      context.eventStream.publish(NewBlockMined(block.header))
+
       viewHolderRef ! LocallyGeneratedModifier(block.header)
       block.blockSections.foreach {
         viewHolderRef ! LocallyGeneratedModifier(_)
       }
-
-      // Immediately announce newly mined block to network BEFORE local application.
-      // This reduces propagation latency by avoiding the wait for NodeViewHolder
-      // to fully validate and apply the block. LocalBlockApplied arrives later
-      // and skips broadcast since the block was already announced.
-      // TODO: Consider switching to direct actor message for lower latency
-      //       instead of event bus publish.
-      context.eventStream.publish(NewBlockMined(block.header))
 
       ApiResponse.OK
     } else {

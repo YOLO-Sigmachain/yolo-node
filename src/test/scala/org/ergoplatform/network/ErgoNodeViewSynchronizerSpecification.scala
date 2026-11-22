@@ -1204,9 +1204,9 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
   }
 
   /**
-    * Test that NewBlockMined immediately broadcasts invs for header and all block sections.
+    * Test that header and all block sections of a mined block are announced when stored, not before.
     */
-  property("NodeViewSynchronizer: NewBlockMined should immediately broadcast invs") {
+  property("NodeViewSynchronizer: NewBlockMined should broadcast invs once sections are stored") {
     withFixture2 { ctx =>
       import ctx._
 
@@ -1219,8 +1219,15 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
 
       val newBlock = statefulyValidFullBlock(wus)
 
-      // Send NewBlockMined to synchronizer
+      // Send NewBlockMined to synchronizer: nothing is stored yet, so nothing is announced
       synchronizerMockRef ! NewBlockMined(newBlock.header)
+      ncProbe.expectNoMessage(500.millis)
+
+      // Header and sections get stored in history: each one is announced at that moment
+      synchronizerMockRef ! SyntacticallySuccessfulModifier(Header.modifierTypeId, newBlock.header.id)
+      newBlock.header.sectionIds.foreach { case (mtId, id) =>
+        synchronizerMockRef ! SyntacticallySuccessfulModifier(mtId, id)
+      }
 
       // Expect 4 inv messages (1 header + 3 sections)
       val invMessages = (0 until 4).map { _ =>
@@ -1241,6 +1248,31 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
         receivedInvs.get(mtId) shouldBe defined
         receivedInvs(mtId) should contain(id)
       }
+    }
+  }
+
+  /**
+    * Test that storing a section which does not belong to the last locally mined block announces nothing.
+    */
+  property("NodeViewSynchronizer: stored section of a not locally mined block is not announced") {
+    withFixture2 { ctx =>
+      import ctx._
+
+      var wus = WrappedUtxoState(boxesHolderGen.sample.get, createTempDir, parameters, settings)
+      val minedBlock = statefulyValidFullBlock(wus)
+      wus = wus.applyModifier(minedBlock, None)(_ => ()).get
+      val otherBlock = statefulyValidFullBlock(wus)
+
+      synchronizerMockRef ! NewBlockMined(minedBlock.header)
+      synchronizerMockRef ! SyntacticallySuccessfulModifier(Header.modifierTypeId, otherBlock.header.id)
+      ncProbe.expectNoMessage(500.millis)
+
+      // the mined header is announced once, a repeated store signal announces nothing
+      synchronizerMockRef ! SyntacticallySuccessfulModifier(Header.modifierTypeId, minedBlock.header.id)
+      val inv = ncProbe.expectMsgType[SendToNetwork](5.seconds).message.data.get.asInstanceOf[InvData]
+      inv.ids should contain(minedBlock.header.id)
+      synchronizerMockRef ! SyntacticallySuccessfulModifier(Header.modifierTypeId, minedBlock.header.id)
+      ncProbe.expectNoMessage(500.millis)
     }
   }
 
@@ -1370,8 +1402,15 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
 
       val newBlock = statefulyValidFullBlock(wus)
 
-      // Send NewBlockMined to synchronizer
+      // Send NewBlockMined to synchronizer: nothing is stored yet, so nothing is announced
       synchronizerMockRef ! NewBlockMined(newBlock.header)
+      ncProbe.expectNoMessage(500.millis)
+
+      // Header and sections get stored in history: each one is announced at that moment
+      synchronizerMockRef ! SyntacticallySuccessfulModifier(Header.modifierTypeId, newBlock.header.id)
+      newBlock.header.sectionIds.foreach { case (mtId, id) =>
+        synchronizerMockRef ! SyntacticallySuccessfulModifier(mtId, id)
+      }
 
       // Expect 4 inv messages (1 header + 3 sections)
       val invMessages = (0 until 4).map { _ =>

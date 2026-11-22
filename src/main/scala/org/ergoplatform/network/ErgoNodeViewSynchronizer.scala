@@ -169,6 +169,13 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   private val nipopowProviders = mutable.Set[ConnectedPeer]()
 
   /**
+    * Header and block sections of the last locally mined block which are not announced yet.
+    * Each one is announced as soon as it is stored in history (see `SyntacticallySuccessfulModifier`),
+    * so a peer never gets an inv for a section this node can not serve yet.
+    */
+  private val minedSectionsToAnnounce = mutable.Map[ModifierId, NetworkObjectTypeId.Value]()
+
+  /**
     * How many peers should have a utxo set snapshot to start downloading it
     */
   private lazy val MinSnapshots = settings.nodeSettings.utxoSettings.p2pUtxoSnapshots
@@ -1507,19 +1514,21 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       }
 
     /**
-      * Immediately announce a newly mined block to all connected peers.
-      * This is called before the block is applied by NodeViewHolder, reducing
-      * propagation latency. LocalBlockApplied arrives later and skips broadcast
-      * since the block was already announced.
+      * A block was mined locally. Its header and sections are announced one by one as soon as each is
+      * stored in history (`SyntacticallySuccessfulModifier`), which is before the block is applied to
+      * state. Announcing right here, before anything is stored, makes a close peer request sections this
+      * node can not serve yet, and the peer then waits for the delivery timeout before asking again.
+      * LocalBlockApplied arrives later and skips broadcast since the block was already announced.
       */
     case NewBlockMined(header) =>
       log.info(
-        s"Immediately announcing newly mined block ${header.encodedId} " +
-        s"at height ${header.height} to all peers"
+        s"Newly mined block ${header.encodedId} at height ${header.height} " +
+        s"will be announced to all peers as its sections are stored"
       )
-      broadcastModifierInv(Header.modifierTypeId, header.id)
+      minedSectionsToAnnounce.clear()
+      minedSectionsToAnnounce.put(header.id, Header.modifierTypeId)
       header.sectionIds.foreach { case (mtId, id) =>
-        broadcastModifierInv(mtId, id)
+        minedSectionsToAnnounce.put(id, mtId)
       }
 
     // Locally mined block applied - skip broadcast (already done via NewBlockMined)
@@ -1582,6 +1591,10 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     case SyntacticallySuccessfulModifier(modTypeId, modId) =>
       deliveryTracker.setHeld(modId, modTypeId)
+      // a section of a locally mined block is stored now, so it can be served: announce it
+      minedSectionsToAnnounce.remove(modId).foreach { _ =>
+        broadcastModifierInv(modTypeId, modId)
+      }
 
     case RecoverableFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Setting recoverable failed modifier $modId as Unknown", e)
