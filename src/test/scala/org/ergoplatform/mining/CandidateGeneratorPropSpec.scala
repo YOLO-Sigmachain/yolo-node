@@ -431,4 +431,10 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
     }
     avgMiningTime shouldBe 200.millis
   }
+
+  property("average block mining time is zero when there is no interval to average") {
+    // exactly one header (a node started at height 1) and no headers at all
+    CandidateGenerator.getBlockMiningTimeAvg(Vector(System.currentTimeMillis())) shouldBe 0.millis
+    CandidateGenerator.getBlockMiningTimeAvg(Vector.empty) shouldBe 0.millis
+  }
 }

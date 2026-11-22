@@ -421,16 +421,20 @@ object CandidateGenerator extends ScorexLogging {
     }
   }
 
-  /** Calculate average mining time from latest block header timestamps */
+  /**
+    * Calculate average mining time from latest block header timestamps.
+    * With less than two timestamps there is no interval to average, the result is zero then.
+    */
   def getBlockMiningTimeAvg(
     timestamps: IndexedSeq[Header.Timestamp]
   ): FiniteDuration = {
     val miningTimes =
       timestamps.sorted
         .sliding(2, 1)
-        .map { case IndexedSeq(prev, next) => next - prev }
+        .collect { case IndexedSeq(prev, next) => next - prev } // a single timestamp gives one group of size 1
         .toVector
-    Math.round(miningTimes.sum / miningTimes.length.toDouble).millis
+    if (miningTimes.isEmpty) 0.millis
+    else Math.round(miningTimes.sum / miningTimes.length.toDouble).millis
   }
 
   /** Get average count of transactions per block */
