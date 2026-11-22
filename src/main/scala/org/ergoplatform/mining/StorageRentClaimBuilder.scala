@@ -2,6 +2,8 @@ package org.ergoplatform.mining
 
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.settings.{Constants, Parameters}
+import org.ergoplatform.wallet.interpreter.ErgoInterpreter
+import org.ergoplatform.wallet.protocol.{Constants => WalletConstants}
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import scorex.util.{ModifierId, ScorexLogging, bytesToId}
 import sigma.{Coll, Colls}
@@ -45,10 +47,48 @@ import scala.collection.mutable.ArrayBuffer
 object StorageRentClaimBuilder extends ScorexLogging {
 
   /**
-    * Max boxes one claim transaction may sweep. Keeps the claim's cost and size well under
-    * block limits
+    * Max boxes one claim transaction may sweep. This bounds the number of boxes only: the
+    * claim's cost also grows with the tokens the boxes carry, and is bounded separately by
+    * the `maxCost` argument of [[buildClaim]] when the caller passes one
     */
   val MaxClaims: Int = 100
+
+  /**
+    * Upper bound on the part of a claim's validation cost that does not depend on its boxes:
+    * the interpreter init cost and one output (the rent fee output, counted whether or not
+    * the claim gets one).
+    */
+  def claimBaseCostBound(parameters: Parameters): Long =
+    ErgoInterpreter.interpreterInitCost.toLong + parameters.outputCost
+
+  /**
+    * Upper bound on what claiming `box` into `output` adds to the claim's validation cost: one
+    * input, one output, the storage rent path in place of the box's script
+    * (`WalletConstants.StorageContractCost`, the interpreter does not run the script there), and the
+    * token terms. Validation charges `tokenAccessCost` once per token entry in the inputs and
+    * the outputs and once per distinct token id on each side
+    * (`ErgoBoxAssetExtractor.totalAssetsAccessCost`); counting every entry as a distinct id
+    * as well gives 2 x `tokenAccessCost` per entry, which is never below the real figure,
+    * however the ids are shared between boxes.
+    */
+  def boxCostBound(box: ErgoBox, output: ErgoBoxCandidate, parameters: Parameters): Long =
+    parameters.inputCost.toLong + parameters.outputCost + WalletConstants.StorageContractCost +
+      2L * parameters.tokenAccessCost * (box.additionalTokens.size + output.additionalTokens.size)
+
+  /**
+    * Upper bound on the part of a claim's size that does not depend on its boxes: counts and the rent fee output to
+    * the miner's P2PK (counted whether or not the claim gets one)
+    */
+  def claimBaseSizeBound(minerPk: ProveDlog): Long =
+    32L + boxSize(p2pkCandidate(Long.MaxValue, ErgoTree.fromSigmaBoolean(minerPk), Int.MaxValue), Short.MaxValue)
+
+  /**
+    * Upper bound on what claiming a box into `output` (at `outputIndex`) adds to the claim's size: the input (box id,
+    * empty proof, the var-127 extension) and the output as a stand-alone box (which spells out each token id and
+    * the transaction id, more than the output takes in a transaction), plus 2 bytes per token for its index
+    */
+  def boxSizeBound(output: ErgoBoxCandidate, outputIndex: Short): Long =
+    40L + boxSize(output, outputIndex) + 2L * output.additionalTokens.size
 
   private val DummyTxId: ModifierId = bytesToId(Array.fill(32)(0.toByte))
 
@@ -99,6 +139,23 @@ object StorageRentClaimBuilder extends ScorexLogging {
     *                             index so the scan window keeps advancing. Too-young boxes
     *                             and recreations dropped for dusty aggregate fees are
     *                             transient and are NOT reported.
+    * @param maxCost              - cost budget for the claim, or None for no budget (upstream).
+    *                             With a budget, a running upper bound of the claim's validation
+    *                             cost is kept ([[claimBaseCostBound]] plus [[boxCostBound]] of
+    *                             every claimed box) and the claim stops at the first box that
+    *                             would take it past the budget. That box and the ones after it
+    *                             are not examined further and NOT reported as permanently
+    *                             skipped, so they stay in the eligibility index and come first
+    *                             in a later candidate. The first claimable box is always
+    *                             admitted, whatever its cost, so the index always moves.
+    * @param maxSize              - size budget for the claim in bytes, or None for no budget (upstream).
+    *                             As `maxCost`, with a running upper bound of the claim's size
+    *                             ([[claimBaseSizeBound]] plus [[boxSizeBound]] of every claimed box)
+    * @param outputCostBound      - with `maxCost`: what an output adds to the cost of the block
+    *                             beside the claim, counted in the claim's cost bound (YOLO: a
+    *                             recreated box locked by the fee proposition is collected by the
+    *                             fee transaction, `YoloFeeOutputPolicy.feeBoxCollectionCost`);
+    *                             none by default
     */
   def buildClaim(eligible: Seq[ErgoBox],
                  currentHeight: Int,
@@ -106,7 +163,10 @@ object StorageRentClaimBuilder extends ScorexLogging {
                  minerPk: ProveDlog,
                  reemissionTokenIdOpt: Option[ModifierId],
                  tokenWhitelist: Set[ModifierId],
-                 onPermanentlySkipped: ErgoBox => Unit = _ => ()): Option[ErgoTransaction] = {
+                 onPermanentlySkipped: ErgoBox => Unit = _ => (),
+                 maxCost: Option[Long] = None,
+                 maxSize: Option[Long] = None,
+                 outputCostBound: ErgoBoxCandidate => Long = _ => 0L): Option[ErgoTransaction] = {
 
     val minerTree = ErgoTree.fromSigmaBoolean(minerPk)
     // every claimed box, in order, with the output it will name in var #127: output i
@@ -117,8 +177,29 @@ object StorageRentClaimBuilder extends ScorexLogging {
     // boxes looked at so far; the cap applies to CLAIMED boxes, not examined ones,
     // so unclaimable boxes can not starve later claimable ones out of the claim
     var examined = 0
+    // with a cost budget: upper bound of the claim's cost so far, and whether the budget stopped the claim
+    var costBound = claimBaseCostBound(parameters)
+    // with a size budget: upper bound of the claim's size so far (not computed without one)
+    var sizeBound = if (maxSize.isDefined) claimBaseSizeBound(minerPk) else 0L
+    var budgetReached = false
 
-    eligible.iterator.takeWhile(_ => claimed.length < MaxClaims).foreach { box =>
+    // claims `box` into `output` unless a budget stops it (the first box is always admitted)
+    def admit(box: ErgoBox, recreate: Boolean, output: ErgoBoxCandidate): Unit = {
+      val withBox = costBound + boxCostBound(box, output, parameters) + outputCostBound(output)
+      val withBoxSize = if (maxSize.isDefined) sizeBound + boxSizeBound(output, claimed.length.toShort) else 0L
+      if (claimed.nonEmpty && (maxCost.exists(withBox > _) || maxSize.exists(withBoxSize > _))) {
+        // left for a later candidate: not examined, not reported as permanently skipped
+        budgetReached = true
+        examined -= 1
+      } else {
+        costBound = withBox
+        sizeBound = withBoxSize
+        if (recreate) sweptFees += box.value - output.value
+        claimed += ((box, recreate, output))
+      }
+    }
+
+    eligible.iterator.takeWhile(_ => claimed.length < MaxClaims && !budgetReached).foreach { box =>
       examined += 1
       val age = currentHeight - box.creationHeight
       val oldEnough = age >= Constants.StoragePeriod
@@ -157,8 +238,7 @@ object StorageRentClaimBuilder extends ScorexLogging {
               dust = dustLimit(recreatedBox, outputIndex, parameters)
             }
             if (recreatedBox.value <= box.value && boxSize(recreatedBox, outputIndex) <= ErgoBox.MaxBoxSize) {
-              sweptFees += box.value - recreatedBox.value
-              claimed += ((box, true, recreatedBox))
+              admit(box, recreate = true, recreatedBox)
             } else {
               onPermanentlySkipped(box)
             }
@@ -180,7 +260,7 @@ object StorageRentClaimBuilder extends ScorexLogging {
             // output past the box size cap, making the whole claim invalid
             if (box.value >= dustLimit(burnOutput, claimed.length.toShort, parameters) &&
               boxSize(burnOutput, claimed.length.toShort) <= ErgoBox.MaxBoxSize) {
-              claimed += ((box, false, burnOutput))
+              admit(box, recreate = false, burnOutput)
             } else {
               onPermanentlySkipped(box)
             }
@@ -224,6 +304,8 @@ object StorageRentClaimBuilder extends ScorexLogging {
         log.info(s"Storage-rent claim built: ${finalClaimed.length} boxes claimed " +
           s"(${finalClaimed.count(_._2)} recreated, ${finalClaimed.count(!_._2)} burned), " +
           s"${examined - claimed.length} skipped, " +
+          (if (budgetReached) s"stopped by a budget (cost ${maxCost.getOrElse("none")}, size " +
+            s"${maxSize.getOrElse("none")}) at a cost bound of $costBound and a size bound of $sizeBound, " else "") +
           s"collecting $collected nanoERG")
         Some(ErgoTransaction(inputs, IndexedSeq.empty, outputCandidates))
       }

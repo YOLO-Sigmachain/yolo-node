@@ -19,9 +19,9 @@ import org.ergoplatform.nodeView.LocallyGeneratedModifier
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils.Height
 import org.ergoplatform.nodeView.history.extra.{ExtraIndexer, NumericBoxIndex}
 import org.ergoplatform.nodeView.history.{ErgoHistoryReader, ErgoHistoryUtils}
-import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
+import org.ergoplatform.nodeView.mempool.{ErgoMemPoolReader, YoloFeeOutputPolicy}
 import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateContext, StateType, UtxoStateReader}
-import org.ergoplatform.settings.{Constants, ErgoSettings, ErgoValidationSettingsUpdate, Parameters}
+import org.ergoplatform.settings.{ChainSettings, Constants, ErgoSettings, ErgoValidationSettingsUpdate, Parameters}
 import org.ergoplatform.sdk.wallet.Constants.MaxAssetsPerBox
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
@@ -29,8 +29,9 @@ import scorex.crypto.authds.{ADDigest, ADKey, SerializedAdProof}
 import scorex.crypto.hash.Digest32
 import scorex.util.encode.Base16
 import scorex.util.{ModifierId, ScorexLogging, bytesToId, idToBytes}
+import sigma.ast.ErgoTree
 import sigma.ast.syntax.ErgoBoxRType
-import sigma.Extensions.ArrayOps
+import sigma.Extensions.{ArrayOps, CollBytesOps}
 import sigma.crypto.CryptoFacade
 import sigma.data.{Digest32Coll, ProveDlog}
 import sigma.interpreter.ProverResult
@@ -743,6 +744,12 @@ object CandidateGenerator extends ScorexLogging {
 
       val emissionTxs = emissionTxOpt.toSeq
 
+      // arguments of the storage-rent claim builder that do not depend on the boxes
+      val rentReemissionTokenIdOpt: Option[ModifierId] =
+        Option(ergoSettings.chainSettings.reemission.reemissionTokenId).filter(_.nonEmpty)
+      val rentTokenWhitelist: Set[ModifierId] =
+        ergoSettings.nodeSettings.storageRentTokenWhitelist.map(id => ModifierId @@ id).toSet
+
       // storage-rent self-claim: sweep rent-eligible boxes directly into the candidate,
       // bypassing the mempool (goes into the block right after the prioritized transactions)
       val rentClaimTxs: Seq[ErgoTransaction] = {
@@ -774,17 +781,21 @@ object CandidateGenerator extends ScorexLogging {
               .flatMap(entry => NumericBoxIndex.getBoxByNumber(history, entry.globalIndex))
               .flatMap(iEb => state.boxById(ADKey @@ idToBytes(iEb.id)))
             val params = upcomingContext.currentParameters
-            val reemissionTokenIdOpt =
-              Option(ergoSettings.chainSettings.reemission.reemissionTokenId).filter(_.nonEmpty)
             val permanentlySkipped = mutable.ArrayBuffer.empty[ModifierId]
             val claimTxs = StorageRentClaimBuilder.buildClaim(
               scanned,
               upcomingHeight,
               params,
               minerPk,
-              reemissionTokenIdOpt,
-              ergoSettings.nodeSettings.storageRentTokenWhitelist.map(id => ModifierId @@ id).toSet,
-              b => permanentlySkipped += bytesToId(b.id)
+              rentReemissionTokenIdOpt,
+              rentTokenWhitelist,
+              b => permanentlySkipped += bytesToId(b.id),
+              // YOLO: the claim's cost is kept within YoloRentClaimCostBudget, so that it always fits beside the
+              // emission and fee transactions in the reserve; boxes left out for the budget stay in the index. The
+              // bound counts what each recreated box locked by the fee proposition adds to the fee transaction
+              maxCost = if (ergoSettings.chainSettings.yolo.enabled) Some(YoloRentClaimCostBudget.toLong) else None,
+              outputCostBound = (o: ErgoBoxCandidate) =>
+                if (ergoSettings.chainSettings.yolo.enabled) yoloFeeOutputCost(params, ergoSettings.chainSettings)(o) else 0L
             ).toSeq
             if (permanentlySkipped.nonEmpty) {
               log.warn(s"Removing ${permanentlySkipped.length} storage-rent eligibility entries " +
@@ -820,6 +831,8 @@ object CandidateGenerator extends ScorexLogging {
       // from the storage-rent index, so a broken eligibility entry is not retried in every
       // candidate. Removal is idempotent, so a claim re-rejected by the retry pass below is
       // handled by the same code without any extra bookkeeping.
+      // With the YOLO switch on, only the boxes `yoloRejectedClaimEviction` names are dropped: none when the claim
+      // lost a race (an input already spent), else the boxes that fail on their own.
       def collectPoolTxs: (Seq[ErgoTransaction], Seq[ModifierId]) = {
         val res = collectTxs(
           minerPk,
@@ -842,11 +855,26 @@ object CandidateGenerator extends ScorexLogging {
         }
         val rejectedRentClaimTxIds = res._2.filter(id => rentClaimTxs.exists(_.id == id))
         if (rejectedRentClaimTxIds.nonEmpty) {
-          val boxIds = rentClaimTxs.filter(tx => rejectedRentClaimTxIds.contains(tx.id))
-            .flatMap(tx => tx.inputs.map(in => bytesToId(in.boxId)))
-          log.warn(s"Storage-rent claim transactions $rejectedRentClaimTxIds rejected during candidate assembly, " +
-            s"removing their ${boxIds.length} input boxes from the storage-rent index")
-          history.removeStorageRentBoxes(boxIds)
+          val rejected = rentClaimTxs.filter(tx => rejectedRentClaimTxIds.contains(tx.id))
+          if (ergoSettings.chainSettings.yolo.enabled) {
+            // boxes spent by the transactions placed before the claims (emission and prioritized) in this candidate
+            val mandatoryIds = (emissionTxs ++ prioritizedTransactions).map(_.id).toSet
+            val spentBefore = res._1.filter(tx => mandatoryIds.contains(tx.id))
+              .flatMap(_.inputs.map(in => bytesToId(in.boxId))).toSet
+            val boxIds = rejected.flatMap { claim =>
+              yoloRejectedClaimEviction(claim, state, upcomingContext, spentBefore, box =>
+                StorageRentClaimBuilder.buildClaim(Seq(box), upcomingContext.currentHeight,
+                  upcomingContext.currentParameters, minerPk, rentReemissionTokenIdOpt, rentTokenWhitelist))
+            }
+            log.warn(s"Storage-rent claim transactions $rejectedRentClaimTxIds rejected during candidate assembly, " +
+              s"removing ${boxIds.length} of their input boxes from the storage-rent index")
+            if (boxIds.nonEmpty) history.removeStorageRentBoxes(boxIds)
+          } else {
+            val boxIds = rejected.flatMap(tx => tx.inputs.map(in => bytesToId(in.boxId)))
+            log.warn(s"Storage-rent claim transactions $rejectedRentClaimTxIds rejected during candidate assembly, " +
+              s"removing their ${boxIds.length} input boxes from the storage-rent index")
+            history.removeStorageRentBoxes(boxIds)
+          }
         }
         res
       }
@@ -929,6 +957,53 @@ object CandidateGenerator extends ScorexLogging {
           }
       }
     }.flatten
+
+  /**
+    * YOLO: input boxes of `claim`, a storage rent claim reported invalid by `YoloAssemblyPolicy.collect`, to remove from the rent
+    * index (`createCandidate`, switch on).
+    *  - None when the claim lost a race: an input is no longer in `state`, or is in `spentBefore` (spent by a
+    *    transaction placed before the claim in the candidate). The claim then failed on `inputsNotSpent` or
+    *    `doublespend` in `YoloAssemblyPolicy.collect`, not on a box of its own. A spent box leaves the index when its block is
+    *    indexed (`ExtraIndexer` marks the rent row of every spent input for deletion), and until then it is not
+    *    resolved by the scan (`state.boxById`); the other boxes are still claimable and stay.
+    *  - Otherwise the claim failed validation. Each input box is checked on its own: `oneBoxClaim(box)` (the
+    *    builder over that box alone) is validated against `state`. The boxes for which no claim is built or whose
+    *    claim fails are removed. If every box passes on its own, the cause is not in one box, and all inputs are
+    *    removed, as upstream, so that the same failing claim is not built again in every candidate.
+    */
+  private[mining] def yoloRejectedClaimEviction(claim: ErgoTransaction,
+                                                state: UtxoStateReader,
+                                                upcomingContext: ErgoStateContext,
+                                                spentBefore: Set[ModifierId],
+                                                oneBoxClaim: ErgoBox => Option[ErgoTransaction]): Seq[ModifierId] = {
+    val inputIds = claim.inputs.map(in => bytesToId(in.boxId))
+    val resolved = claim.inputs.map(in => state.boxById(in.boxId))
+    if (resolved.exists(_.isEmpty) || inputIds.exists(spentBefore.contains)) {
+      log.info(s"Storage-rent claim ${claim.id} lost a race (an input is already spent), keeping its boxes indexed")
+      Seq.empty
+    } else {
+      val maxCost = state.stateContext.currentParameters.maxBlockCost
+      val offending = resolved.flatten.filter { box =>
+        oneBoxClaim(box).forall(tx => state.validateWithCost(tx, upcomingContext, maxCost, None).isFailure)
+      }.map(b => bytesToId(b.id))
+      if (offending.nonEmpty) {
+        log.warn(s"Storage-rent claim ${claim.id} is invalid; ${offending.length} of its boxes fail on their own: " +
+          s"$offending")
+        offending
+      } else {
+        log.warn(s"Storage-rent claim ${claim.id} is invalid, but each of its boxes passes on its own; removing all " +
+          s"${inputIds.length}")
+        inputIds
+      }
+    }
+  }
+
+  /**
+    * YOLO: what an output of the miner's own rent claim adds to the fee transaction: `feeBoxCollectionCost` for a
+    * box locked by the fee proposition (an old fee box the claim recreates), else nothing
+    */
+  private[mining] def yoloFeeOutputCost(params: Parameters, cs: ChainSettings)(output: ErgoBoxCandidate): Long =
+    if (YoloFeeOutputPolicy.isFeeOutput(output, cs)) YoloFeeOutputPolicy.feeBoxCollectionCost(output, params) else 0L
 
   /**
     * Check of the emission tx before an emission-only candidate is made of it (`createCandidate` fallback): with the
@@ -1190,7 +1265,15 @@ object CandidateGenerator extends ScorexLogging {
     val feeBoxes: Seq[ErgoBox] = ErgoState
       .newBoxes(txs)
       .filter(b => java.util.Arrays.equals(b.propositionBytes, propositionBytes) && !inputs.exists(i => java.util.Arrays.equals(i.boxId, b.id)))
-    val feeTxOpt: Option[ErgoTransaction] = if (feeBoxes.nonEmpty) {
+    val feeTxOpt: Option[ErgoTransaction] = if (feeBoxes.nonEmpty && chainSettings.yolo.enabled) {
+      // YOLO: collect only the fee boxes whose tokens fit in the one miner output (the fee script allows exactly one
+      // output); the others stay unspent, nothing is burned
+      yoloFeeCollection(feeBoxes, minerProp, nextHeight, stateContext.currentParameters).map {
+        case (collected, minerBox) =>
+          val inputs = collected.map(b => new Input(b.id, ProverResult.empty))
+          ErgoTransaction(inputs.toIndexedSeq, IndexedSeq(), IndexedSeq(minerBox))
+      }
+    } else if (feeBoxes.nonEmpty) {
       val feeAmount = feeBoxes.map(_.value).sum
       val feeAssets =
         feeBoxes.toArray.toColl.flatMap(_.additionalTokens).take(MaxAssetsPerBox)
@@ -1203,6 +1286,90 @@ object CandidateGenerator extends ScorexLogging {
     }
 
     Seq(emissionTxOpt, feeTxOpt).flatten
+  }
+
+  private val DummyTxId: ModifierId = bytesToId(Array.fill(32)(0.toByte))
+
+  /** Bytes a non-negative value takes in a box (VLQ, 7 bits per byte) */
+  private def vlqLength(v: Long): Int = if (v == 0) 1 else (64 - java.lang.Long.numberOfLeadingZeros(v) + 6) / 7
+
+  /**
+    * YOLO fee collection (`collectRewards` with the switch on): the fee boxes to collect from `feeBoxes` and the
+    * miner output collecting them, or None when none can be collected.
+    *
+    * Every fee box without tokens is taken first: it only adds value, so it always fits (the output stays far below
+    * `ErgoBox.MaxBoxSize`, and each fee box carries at least `minValuePerByte` per byte of its own size, which is
+    * larger than the output's). The fee boxes carrying tokens come next, in the order given (`ErgoState.newBoxes`:
+    * by box id, as upstream), each only if the miner output, with its value added and its tokens merged by id
+    * (amounts summed), stays a valid box: at most `MaxAssetsPerBox` (100) token entries, no token amount or value
+    * past `Long.MaxValue`, at most `ErgoBox.MaxBoxSize` bytes, and a value of at least `minValuePerByte` per byte. So
+    * a sender cannot use tokens on its own fee boxes to push token-free fee boxes out. The fee transaction spends the
+    * collected boxes in the order given.
+    *
+    * A token-carrying fee box that does not fit is left out and the next one is tried. It stays unspent in the UTXO
+    * set, and the fee script would let the miner of a later block spend it, but no stock node does: a node collects
+    * only the fee boxes created in the block it is building (`ErgoState.newBoxes(txs)` in `collectRewards`). So its
+    * value is lost to the miners of stock nodes. With the switch on, the mempool refuses fee outputs carrying tokens
+    * (`YoloFeeOutputPolicy`), so such boxes reach a candidate only through transactions the miner is told to include
+    * or that got into the pool without that check. Nothing is burned: every token of a collected fee box is in the
+    * miner output with its full amount. As the output never has more than `MaxAssetsPerBox` token entries,
+    * upstream's `take(MaxAssetsPerBox)` cut is never needed and not applied.
+    *
+    * Until one is collected, each fee box examined is tried on its own, so the result is None only when no fee box
+    * is a valid miner output on its own.
+    */
+  private[mining] def yoloFeeCollection(feeBoxes: Seq[ErgoBox],
+                                        minerProp: ErgoTree,
+                                        nextHeight: Int,
+                                        parameters: Parameters): Option[(Seq[ErgoBox], ErgoBoxCandidate)] = {
+    val boxes = feeBoxes.toIndexedSeq
+    // positions in `boxes` of the collected fee boxes
+    val collected = mutable.ArrayBuffer.empty[Int]
+    // token id -> (id, amount), in the order the ids are first met
+    var tokens = mutable.LinkedHashMap.empty[ModifierId, (TokenId, Long)]
+    var value = 0L
+    var minerBox: Option[ErgoBoxCandidate] = None
+
+    def candidate(v: Long, ts: mutable.LinkedHashMap[ModifierId, (TokenId, Long)]): ErgoBoxCandidate =
+      new ErgoBoxCandidate(v, minerProp, nextHeight, Colls.fromItems(ts.values.toSeq: _*), Map())
+
+    def valid(box: ErgoBoxCandidate): Boolean = {
+      val size = box.toBox(DummyTxId, 0).bytes.length
+      size <= ErgoBox.MaxBoxSize && box.value >= size.toLong * parameters.minValuePerByte
+    }
+
+    // token-free fee boxes first, then the token-carrying ones, each group in the order given
+    val (tokenFree, withTokens) = boxes.indices.partition(i => boxes(i).additionalTokens.isEmpty)
+    (tokenFree ++ withTokens).foreach { idx =>
+      val feeBox = boxes(idx)
+      Try {
+        val newValue = Math.addExact(value, feeBox.value)
+        if (feeBox.additionalTokens.isEmpty && minerBox.isDefined && vlqLength(newValue) == vlqLength(value)) {
+          // no new token and the value takes as many bytes: the output keeps its size, and its value only grows
+          (newValue, tokens, candidate(newValue, tokens), true)
+        } else {
+          val newTokens = tokens.clone()
+          feeBox.additionalTokens.toArray.foreach { case (id, amount) =>
+            val key = id.toModifierId
+            val total = newTokens.get(key).map(t => Math.addExact(t._2, amount)).getOrElse(amount)
+            newTokens.put(key, id -> total)
+          }
+          val box = candidate(newValue, newTokens)
+          (newValue, newTokens, box, newTokens.size <= MaxAssetsPerBox && valid(box))
+        }
+      } match {
+        case Success((newValue, newTokens, box, true)) =>
+          collected += idx
+          value = newValue
+          tokens = newTokens
+          minerBox = Some(box)
+        case Success(_) =>
+          log.debug(s"Fee box ${feeBox.id} does not fit in the miner output, leaving it unspent")
+        case Failure(e) =>
+          log.debug(s"Fee box ${feeBox.id} does not fit in the miner output (${e.getMessage}), leaving it unspent")
+      }
+    }
+    minerBox.map(collected.sorted.map(boxes).toSeq -> _)
   }
 
   /**
