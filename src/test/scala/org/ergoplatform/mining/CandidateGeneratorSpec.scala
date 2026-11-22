@@ -89,6 +89,54 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.terminate()
   }
 
+  it should "reject a solution which fits no cached candidate, without failing" in new TestKit(
+    ActorSystem()
+  ) {
+    val replyProbe = new TestProbe(system)
+    // real proof-of-work (the default test scheme accepts anything) at difficulty 100,000,
+    // so an arbitrary nonce is not a valid solution
+    val fakePow = defaultSettings.chainSettings.powScheme
+    val hardSettings: ErgoSettings = defaultSettings.copy(
+      chainSettings = defaultSettings.chainSettings.copy(
+        initialDifficultyHex = "0186a0",
+        powScheme            = new AutolykosPowScheme(fakePow.k, fakePow.n)
+      ),
+      directory     = java.nio.file.Files.createTempDirectory("candidate-generator-spec").toString
+    )
+    val viewHolderRef: ActorRef    = ErgoNodeViewRef(hardSettings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+
+    val candidateGenerator: ActorRef =
+      CandidateGenerator(
+        defaultMinerSecret.publicImage,
+        readersHolderRef,
+        viewHolderRef,
+        hardSettings
+      )
+
+    // the first candidate: there is no previous candidate cached
+    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), replyProbe.ref)
+    replyProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(_: Candidate) =>
+    }
+
+    // a solution which does not fit the candidate (e.g. a late solution for a candidate dropped already)
+    val pk            = defaultMinerSecret.publicImage.value
+    val wrongSolution = AutolykosSolution(pk, pk, Array.fill(8)(0: Byte), BigInt(0))
+    candidateGenerator.tell(wrongSolution, replyProbe.ref)
+    // an error reply, not an exception in the actor (which would leave the sender without any reply)
+    replyProbe.expectMsgPF(blockValidationDelay) {
+      case r: StatusReply[_] if r.isError =>
+    }
+
+    // the generator still serves candidates
+    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), replyProbe.ref)
+    replyProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(_: Candidate) =>
+    }
+    system.terminate()
+  }
+
   it should "recover when locally mined block is invalidated by node view holder" in new TestKit(
     ActorSystem()
   ) {
