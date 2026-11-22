@@ -1,7 +1,7 @@
 package org.ergoplatform.settings
 
 import com.typesafe.config.ConfigFactory
-import org.ergoplatform.mining.{AutolykosPowScheme, DefaultFakePowScheme}
+import org.ergoplatform.mining.{AutolykosPowScheme, CandidateGenerator, DefaultFakePowScheme}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.utils.ErgoCorePropertyTest
 
@@ -62,7 +62,11 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.launchParameters.blockVersion shouldBe Header.Interpreter60Version
     s.chainSettings.genesisBlockVersion(s.launchParameters.blockVersion) shouldBe Header.Interpreter60Version
     s.launchParameters.storageFeeFactor shouldBe 300000
+    // block cost limit 1,500,000 at genesis; mempool relay limit 1,000,000 (testnet.conf: 800,000), within the room
+    // a full block leaves for one pool transaction, so no start-up warning
     s.launchParameters.maxBlockCost shouldBe 1500000
+    s.nodeSettings.maxTransactionCost shouldBe 1000000
+    CandidateGenerator.yoloRelayLimitWarning(s) shouldBe None
     // EIP-37 epoch 64, and the plain difficulty epoch set to match; genesis difficulty placeholder at the floor
     // (never "01")
     s.chainSettings.eip37EpochLength shouldBe Some(64)
@@ -394,6 +398,68 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     val mainCfg = ConfigFactory.parseURL(mainAppConf)
     mainCfg.hasPath("ergo.chain.yolo.enabled") shouldBe true
     ErgoSettingsReader.unknownYoloKeysError(mainCfg) shouldBe None
+  }
+
+  property("start-up warning: a relay limit above the room a full block leaves (block cost limit of the launch " +
+    "parameters - safe gap - reserve for the mandatory txs) is warned of with the switch on, never with it off") {
+    // the assembly safe gap tiers
+    CandidateGenerator.safeGap(999999) shouldBe 0
+    CandidateGenerator.safeGap(1000000) shouldBe 150000
+    CandidateGenerator.safeGap(4999999) shouldBe 150000
+    CandidateGenerator.safeGap(5000000) shouldBe 500000
+    CandidateGenerator.YoloMandatoryTxsCostReserve shouldBe 300000
+    CandidateGenerator.YoloRentClaimCostBudget shouldBe 270000
+
+    val s = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    s.chainSettings.yolo.enabled shouldBe true
+    def withLimit(x: Int, on: Boolean = true): ErgoSettings = s.copy(
+      nodeSettings = s.nodeSettings.copy(maxTransactionCost = x),
+      chainSettings = s.chainSettings.copy(yolo = s.chainSettings.yolo.copy(enabled = on)))
+    // 1,500,000 - 150,000 - 300,000 - 2
+    val room = 1049998
+
+    // the shipped value, and up to the room: no warning
+    CandidateGenerator.yoloRelayLimitWarning(s) shouldBe None
+    CandidateGenerator.yoloRelayLimitWarning(withLimit(room)) shouldBe None
+    // one above the room, and 1,200,000: warned of, with the numbers
+    Seq(room + 1, 1200000).foreach { x =>
+      val w = CandidateGenerator.yoloRelayLimitWarning(withLimit(x))
+      w shouldBe defined
+      w.get should include(s"ergo.node.maxTransactionCost = $x is above the $room a full block leaves")
+      w.get should include("block cost limit 1500000 of the launch parameters")
+      w.get should include("safe gap 150000")
+      w.get should include("minus 300000 kept for the emission transaction, a storage rent claim within its cost " +
+        "budget of 270000 and the fee transaction, minus 2")
+      w.get should include(s"Set maxTransactionCost to $room or less")
+    }
+    // switch off: never, whatever the value (upstream has no such warning)
+    CandidateGenerator.yoloRelayLimitWarning(withLimit(1200000, on = false)) shouldBe None
+    CandidateGenerator.yoloRelayLimitWarning(settings) shouldBe None
+  }
+
+  property("relay limit check against the block cost limit in use: warned of once votes move the limit below " +
+    "what the relay limit needs, never at the launch value, never with the switch off") {
+    val s = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    s.nodeSettings.maxTransactionCost shouldBe 1000000
+    s.launchParameters.maxBlockCost shouldBe 1500000
+    def off: ErgoSettings = s.copy(chainSettings = s.chainSettings.copy(yolo = s.chainSettings.yolo.copy(enabled = false)))
+
+    // the launch value is the start-up warning's business
+    CandidateGenerator.yoloVotedRelayLimitWarning(s, 1500000) shouldBe None
+    // voted up, or down while the relay limit still fits (room = limit - 150,000 - 300,000 - 2 >= 1,000,000)
+    CandidateGenerator.yoloVotedRelayLimitWarning(s, 1515000) shouldBe None
+    CandidateGenerator.yoloVotedRelayLimitWarning(s, 1450002) shouldBe None
+    // voted to 1,450,001 or below: the room drops under the relay limit
+    val w = CandidateGenerator.yoloVotedRelayLimitWarning(s, 1450001)
+    w shouldBe defined
+    w.get should include("ergo.node.maxTransactionCost = 1000000 is above the 999999 a full block leaves")
+    w.get should include("block cost limit 1450001 in use (voted; launch value 1500000)")
+    w.get should include("Set maxTransactionCost to 999999 or less")
+    // the same pure message the start-up warning uses
+    w shouldBe CandidateGenerator.yoloRelayLimitMessage(1000000, 1450001, "in use (voted; launch value 1500000)")
+    // switch off: never
+    CandidateGenerator.yoloVotedRelayLimitWarning(off, 1450001) shouldBe None
+    CandidateGenerator.yoloVotedRelayLimitWarning(off, 1000000) shouldBe None
   }
 
   property("launch parameters: upstream selection with the switch off, YOLO parameters with it on") {

@@ -804,15 +804,16 @@ object CandidateGenerator extends ScorexLogging {
         log.debug(s"Storage-rent claim transactions injected into the candidate: ${rentClaimTxs.map(_.id)}")
       }
 
-      // todo: remove in 5.0
-      // we allow for some gap, to avoid possible problems when different interpreter version can estimate cost
-      // differently due to bugs in AOT costing
-      val safeGap = if (state.stateContext.currentParameters.maxBlockCost < 1000000) {
-        0
-      } else if (state.stateContext.currentParameters.maxBlockCost < 5000000) {
-        150000
-      } else {
-        500000
+      val safeGap = CandidateGenerator.safeGap(state.stateContext.currentParameters.maxBlockCost)
+
+      if (ergoSettings.chainSettings.yolo.enabled) {
+        // YOLO: the start-up relay limit check used the launch block cost limit; check again whenever the limit in
+        // use (it can be voted) changes, and warn once per change
+        val blockCostInUse = state.stateContext.currentParameters.maxBlockCost
+        if (!yoloCheckedBlockCost.contains(blockCostInUse)) {
+          yoloCheckedBlockCost = Some(blockCostInUse)
+          yoloVotedRelayLimitWarning(ergoSettings, blockCostInUse).foreach(msg => log.warn(msg))
+        }
       }
 
       // A storage-rent claim rejected during candidate assembly gets its input boxes dropped
@@ -955,6 +956,106 @@ object CandidateGenerator extends ScorexLogging {
     * Transaction and its cost.
     */
   type CostedTransaction = (ErgoTransaction, Int)
+
+  /**
+    * Cost left free under the block cost limit during candidate assembly: 0 below a limit of 1,000,000, 150,000
+    * below 5,000,000, 500,000 from there. Upstream: "we allow for some gap, to avoid possible problems when different
+    * interpreter version can estimate cost differently due to bugs in AOT costing" (todo: remove in 5.0).
+    */
+  def safeGap(maxBlockCost: Int): Int = {
+    if (maxBlockCost < 1000000) {
+      0
+    } else if (maxBlockCost < 5000000) {
+      150000
+    } else {
+      500000
+    }
+  }
+
+  /**
+    * YOLO: share of `YoloMandatoryTxsCostReserve` for the emission transaction (13,109 measured at height
+    * 1,051,300, `YoloBlockAssemblySpec`)
+    */
+  val YoloEmissionTxCostAllowance: Int = 15000
+
+  /**
+    * YOLO: share of `YoloMandatoryTxsCostReserve` for the fee transaction: 12,189 measured for one fee box, about
+    * 2,090 more for each further one, so it covers two fee boxes; more fee boxes take from the room left for pool
+    * transactions. With the switch on, each relayed transaction carries the cost of its own fee boxes within its
+    * relay cost (`YoloFeeOutputPolicy.feeCollectionCost`), so this allowance only needs to cover the part of the fee
+    * transaction that does not depend on its inputs (`YoloFeeOutputPolicy.feeTxBaseCost`, 10,100)
+    */
+  val YoloFeeTxCostAllowance: Int = 15000
+
+  /**
+    * YOLO: block cost kept for the transactions every candidate of a rent-collecting miner may carry before the
+    * pool transactions: the emission transaction (`YoloEmissionTxCostAllowance`), the storage rent claim
+    * (`YoloRentClaimCostBudget`) and the fee transaction (`YoloFeeTxCostAllowance`).
+    */
+  val YoloMandatoryTxsCostReserve: Int = 300000
+
+  /**
+    * YOLO: cost budget of the miner's own storage rent claim (`StorageRentClaimBuilder.buildClaim`, `maxCost`):
+    * the reserve less the emission and fee transaction allowances, 270,000. The builder keeps an upper bound of the
+    * claim's cost within it, so the reserve holds by construction whatever tokens the claimed boxes carry. A claim
+    * of `StorageRentClaimBuilder.MaxClaims` = 100 boxes without tokens (225,100 measured) is built whole.
+    */
+  val YoloRentClaimCostBudget: Int = YoloMandatoryTxsCostReserve - YoloEmissionTxCostAllowance - YoloFeeTxCostAllowance
+
+  /**
+    * Block cost limit (in use, voted) for which `createCandidate` last ran the relay limit check; YOLO switch on only
+    */
+  @volatile private var yoloCheckedBlockCost: Option[Int] = None
+
+  /**
+    * YOLO relay limit check, pure: Some(message) when `relayLimit` (`ergo.node.maxTransactionCost`) is above the room
+    * a full block with cost limit `blockCost` leaves for one pool transaction, that is `blockCost` minus `safeGap`
+    * minus `YoloMandatoryTxsCostReserve` minus 2 (`YoloAssemblyPolicy.relayLimitInUse`); None when it fits. `which`
+    * says where `blockCost` comes from.
+    */
+  def yoloRelayLimitMessage(relayLimit: Int, blockCost: Int, which: String): Option[String] = {
+    val gap = safeGap(blockCost)
+    val room = blockCost - gap - YoloMandatoryTxsCostReserve - 2
+    if (relayLimit <= room) {
+      None
+    } else {
+      Some(s"ergo.node.maxTransactionCost = $relayLimit is above the $room a full block leaves for one pool " +
+        s"transaction (block cost limit $blockCost $which, minus the assembly safe gap $gap, " +
+        s"minus $YoloMandatoryTxsCostReserve kept for the emission transaction, a storage rent claim within its cost " +
+        s"budget of $YoloRentClaimCostBudget and the fee transaction, minus 2): a transaction this node accepts and " +
+        s"relays may never fit in a block. Set maxTransactionCost to $room or less")
+    }
+  }
+
+  /**
+    * YOLO start-up warning: with the switch on, `yoloRelayLimitMessage` for the block cost limit of the launch
+    * parameters. Such a transaction is accepted and relayed but may never fit in a block beside the mandatory
+    * transactions. None with the switch off or when the limit fits. A warning only: `ErgoSettingsReader` logs it at
+    * WARN level at start and the node starts anyway.
+    */
+  def yoloRelayLimitWarning(settings: ErgoSettings): Option[String] = {
+    if (!settings.chainSettings.yolo.enabled) {
+      None
+    } else {
+      yoloRelayLimitMessage(settings.nodeSettings.maxTransactionCost, settings.launchParameters.maxBlockCost,
+        "of the launch parameters")
+    }
+  }
+
+  /**
+    * YOLO: the same check for the block cost limit in use, `blockCostInUse`, once votes have moved it away from the
+    * launch value (`createCandidate` runs it once per change and logs it at WARN level). None with the switch off,
+    * when the limit in use is the launch value (the start-up warning covers it) or when the relay limit fits.
+    */
+  def yoloVotedRelayLimitWarning(settings: ErgoSettings, blockCostInUse: Int): Option[String] = {
+    val launch = settings.launchParameters.maxBlockCost
+    if (!settings.chainSettings.yolo.enabled || blockCostInUse == launch) {
+      None
+    } else {
+      yoloRelayLimitMessage(settings.nodeSettings.maxTransactionCost, blockCostInUse,
+        s"in use (voted; launch value $launch)")
+    }
+  }
 
   //TODO move ErgoMiner to mining package and make `collectTxs` and `fixTxsConflicts` private[mining]
 

@@ -5,7 +5,7 @@ import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.server.{Directive1, ValidationRejection}
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
-import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
+import org.ergoplatform.nodeView.mempool.{ErgoMemPoolReader, YoloFeeOutputPolicy}
 import org.ergoplatform.nodeView.state.{ErgoStateReader, UtxoStateReader}
 import org.ergoplatform.settings.{Algos, Constants, ErgoSettings}
 import scorex.core.api.http.ApiRoute
@@ -135,11 +135,15 @@ trait ErgoBaseApiRoute extends ApiRoute with ApiCodecs {
         case (utxo: UtxoStateReader, mp: ErgoMemPoolReader) =>
           val maxTxCost = ergoSettings.nodeSettings.maxTransactionCost
           val validationContext = utxo.stateContext.simplifiedUpcoming()
-          utxo.withMempool(mp)
-            .validateWithCost(tx, validationContext, maxTxCost, None)
+          // with the YOLO switch on, also the fee output policy of mempool acceptance (YoloFeeOutputPolicy); with it
+          // off, exactly utxo.withMempool(mp).validateWithCost(tx, validationContext, maxTxCost, None)
+          YoloFeeOutputPolicy.validateWithCost(utxo.withMempool(mp), tx, validationContext, maxTxCost)
             .map(cost => new UnconfirmedTransaction(tx, Some(cost), now, now, bytes, source = None))
-        case _ =>
+        case (s, _) =>
+          // digest mode: syntax only, and with the YOLO switch on the token part of the fee output policy, as the
+          // mempool applies it in this mode (checkTokens is always a Success with the switch off)
           tx.statelessValidity()
+            .flatMap(_ => YoloFeeOutputPolicy.checkTokens(tx, s.stateContext.chainSettings))
             .map(_ => new UnconfirmedTransaction(tx, None, now, now, bytes, source = None)
             )
       }

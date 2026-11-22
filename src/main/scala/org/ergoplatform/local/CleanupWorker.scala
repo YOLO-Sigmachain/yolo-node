@@ -3,9 +3,9 @@ package org.ergoplatform.local
 import akka.actor.{Actor, ActorRef}
 import org.ergoplatform.local.CleanupWorker.RunCleanup
 import org.ergoplatform.local.MempoolAuditor.CleanupDone
-import org.ergoplatform.modifiers.mempool.UnconfirmedTransaction
-import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
-import org.ergoplatform.nodeView.state.UtxoStateReader
+import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
+import org.ergoplatform.nodeView.mempool.{ErgoMemPoolReader, YoloFeeOutputPolicy}
+import org.ergoplatform.nodeView.state.{ErgoStateContext, UtxoStateReader}
 import org.ergoplatform.settings.NodeConfigurationSettings
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, RecheckedTransactions}
 import scorex.util.{ModifierId, ScorexLogging}
@@ -13,7 +13,7 @@ import scorex.util.{ModifierId, ScorexLogging}
 import scala.annotation.tailrec
 import scala.collection.mutable
 import scala.concurrent.Future
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 import scala.concurrent.ExecutionContext.Implicits.global
 
 /**
@@ -87,7 +87,7 @@ class CleanupWorker(nodeViewHolderRef: ActorRef,
       txs match {
         case head :: tail if costAcc < CostLimit =>
           val validationContext = state.stateContext.simplifiedUpcoming()
-          state.validateWithCost(head.transaction, validationContext, nodeSettings.maxTransactionCost, None) match {
+          CleanupWorker.revalidate(state, head.transaction, validationContext, nodeSettings.maxTransactionCost) match {
             case Success(txCost) =>
               val updTx = head.withCost(txCost)
               validationLoop(tail, validated += updTx, invalidated, txCost + costAcc)
@@ -117,5 +117,18 @@ object CleanupWorker {
     * @param mempool - mempool reader instance
     */
   case class RunCleanup(validator: UtxoStateReader, mempool: ErgoMemPoolReader)
+
+  /**
+    * Revalidation of one pool transaction, the cost limit being `ergo.node.maxTransactionCost`: with the YOLO switch
+    * on (`context.chainSettings`), also the fee output policy of mempool acceptance (`YoloFeeOutputPolicy`), so that
+    * a transaction which got into the pool without it (a transaction of a rolled back block, or one accepted before
+    * a parameter change) is removed; with the switch off, exactly
+    * `state.validateWithCost(tx, context, maxTransactionCost, None)`.
+    */
+  def revalidate(state: UtxoStateReader,
+                 tx: ErgoTransaction,
+                 context: ErgoStateContext,
+                 maxTransactionCost: Int): Try[Int] =
+    YoloFeeOutputPolicy.validateWithCost(state, tx, context, maxTransactionCost)
 
 }

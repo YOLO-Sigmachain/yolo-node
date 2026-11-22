@@ -10,6 +10,7 @@ import net.ceedubs.ficus.readers.ArbitraryTypeReader._
 import org.ergoplatform.nodeView.state.StateType.Digest
 import org.ergoplatform.nodeView.state.YoloGenesis
 import org.ergoplatform.ErgoApp
+import org.ergoplatform.mining.CandidateGenerator
 import org.ergoplatform.mining.difficulty.DifficultySerializer
 import scorex.util.ScorexLogging
 import org.ergoplatform.settings.ErgoSettings.{configPath, scorexConfigPath}
@@ -341,6 +342,8 @@ object ErgoSettingsReader extends ScorexLogging
       if (settings.chainSettings.yolo.enabled) {
         YoloGenesis.testSignerKeysWarning(settings.chainSettings.yolo.emission).foreach(w => log.error(w))
       }
+      // a relay limit above what a full block leaves for one pool transaction is shown (switch on only)
+      CandidateGenerator.yoloRelayLimitWarning(settings).foreach(w => log.warn(w))
       settings
     }
   }

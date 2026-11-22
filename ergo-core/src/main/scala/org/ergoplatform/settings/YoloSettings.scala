@@ -61,6 +61,7 @@ object YoloSettings {
   /**
     * Genesis maximum block cost on YOLO (Ergo: `Parameters.MaxBlockCostDefault` = 1,000,000). Used by
     * `YoloLaunchParameters`. Voteable afterwards like any other parameter, in steps of 1% of the current value.
+    * The per-transaction relay limit is a node setting, `ergo.node.maxTransactionCost` (1,000,000 in yolo-testnet.conf).
     */
   val MaxBlockCost: Int = 1500000
 

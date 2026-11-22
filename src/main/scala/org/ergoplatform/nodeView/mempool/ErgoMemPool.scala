@@ -343,9 +343,17 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                 }
 
                 val validationContext = utxo.stateContext.simplifiedUpcoming()
-                utxoWithPool.validateWithCost(tx, validationContext, costLimit, None) match {
+                // with the YOLO switch on, also the fee output policy (YoloFeeOutputPolicy); with it off, exactly
+                // utxoWithPool.validateWithCost(tx, validationContext, costLimit, None)
+                YoloFeeOutputPolicy.validateWithCost(utxoWithPool, tx, validationContext, costLimit) match {
                   case Success(cost) =>
                     acceptIfNoDoubleSpend(unconfirmedTx.withCost(cost), validationStartTime)
+                  case Failure(refusal: YoloFeeOutputPolicy.Refusal) =>
+                    log.info(s"Mempool rejecting transaction ${tx.id}: ${refusal.getMessage}")
+                    // a policy decline, not a validation failure (no peer is penalised); the id is cached as
+                    // invalidated, as for the re-emission prefilter above, so the transaction is not processed again
+                    (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption),
+                      new ProcessingOutcome.Declined(refusal, validationStartTime))
                   case Failure(ex) =>
                     this.invalidate(unconfirmedTx) -> new ProcessingOutcome.Invalidated(ex, validationStartTime)
                 }
@@ -356,7 +364,16 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
             case _ =>
               // Accept transaction in case of "digest" state. Transactions are not downloaded in this mode from other
               // peers though, so such transactions can come from the local wallet only.
-              acceptIfNoDoubleSpend(unconfirmedTx, validationStartTime)
+              // With the YOLO switch on, the token part of the fee output policy still applies (no cost is known
+              // here, so its cost part cannot); with it off, checkTokens is always a Success.
+              YoloFeeOutputPolicy.checkTokens(tx, state.stateContext.chainSettings) match {
+                case Failure(refusal) =>
+                  log.info(s"Mempool rejecting transaction ${tx.id}: ${refusal.getMessage}")
+                  (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption),
+                    new ProcessingOutcome.Declined(refusal, validationStartTime))
+                case Success(_) =>
+                  acceptIfNoDoubleSpend(unconfirmedTx, validationStartTime)
+              }
           }
         } else {
           val msg = if (this.contains(tx.id)) {
