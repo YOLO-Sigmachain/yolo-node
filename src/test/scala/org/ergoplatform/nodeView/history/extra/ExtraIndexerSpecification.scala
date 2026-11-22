@@ -2,7 +2,7 @@ package org.ergoplatform.nodeView.history.extra
 
 import akka.actor.{Actor, ActorIdentity, ActorRef, ActorSystem, Identify, Props, Terminated}
 import akka.testkit.TestProbe
-import org.ergoplatform.ErgoAddressEncoder
+import org.ergoplatform.{ErgoAddressEncoder, ErgoBox}
 import org.ergoplatform.consensus.{ModifierSemanticValidity, ProgressInfo}
 import org.ergoplatform.core.idToVersion
 import org.ergoplatform.http.api.SortDirection
@@ -20,7 +20,7 @@ import org.ergoplatform.nodeView.history.storage.modifierprocessors.FullBlockPro
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.CurrentView
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
-import org.ergoplatform.nodeView.state.ErgoStateReader
+import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateReader}
 import org.ergoplatform.settings.{ErgoSettings, NetworkType}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.createDigestState
@@ -41,6 +41,8 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
 
   implicit val addressEncoder: ErgoAddressEncoder = settings.addressEncoder
   val initSettings: ErgoSettings = settings
+  /** Genesis boxes of the test chains, which the indexer numbers from 0 ahead of the outputs of block 1. */
+  lazy val genesisBoxes: Seq[ErgoBox] = ErgoState.genesisBoxes(initSettings.chainSettings)
   case class CreateDB(blockCount: Int)
   case class ExtendDB(blockCount: Int)
   case class Reset()
@@ -109,36 +111,37 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val addresses: ID_LL = mutable.HashMap[ModifierId, (Long, Long)]()
     val templates: ID_LL = mutable.HashMap[ModifierId, (Long, Long)]()
     val indexedTokens: ID_LL = mutable.HashMap[ModifierId, (Long, Long)]()
+    def receive(output: ErgoBox, height: Int): Unit = {
+      boxesIndexed += 1
+      val address = hashErgoTree(ExtraIndexer.getAddress(output.ergoTree)(addressEncoder).script)
+      val prevAddress = addresses.getOrElse(address, (0L, 0L))
+      addresses.put(address, (prevAddress._1 + output.value, prevAddress._2 + output.additionalTokens.toArray.map(_._2).sum))
+      val template = hashTreeTemplate(ExtraIndexer.getAddress(output.ergoTree)(addressEncoder).script)
+      val prevTemplate = templates.getOrElse(template, (0L, 0L))
+      templates.put(template, (prevTemplate._1, prevTemplate._2 + 1))
+      cfor(0)(_ < output.additionalTokens.length, _ + 1) { j =>
+        val token = IndexedToken.fromBox(new IndexedErgoBox(height, None, None, None, output, 0), j)
+        val prev2 = indexedTokens.getOrElse(token.id, (0L, 0L))
+        indexedTokens.put(token.id, (prev2._1 + 1, 0))
+      }
+    }
+    // the genesis boxes are indexed at height 1, ahead of the transactions of block 1
+    if (limit >= 1) genesisBoxes.foreach(receive(_, 1))
     cfor(1)(_ <= limit, _ + 1) { i =>
       val header = fullChainHeaderAt(i)
       val block = history.getFullBlock(header)
       block.get.transactions.foreach { tx =>
         txsIndexed += 1
-        if (i != 1) {
-          tx.inputs.foreach { input =>
-            val iEb: IndexedErgoBox = _history.getReader.typedExtraIndexById[IndexedErgoBox](bytesToId(input.boxId)).get
-            val address = hashErgoTree(ExtraIndexer.getAddress(iEb.box.ergoTree)(addressEncoder).script)
-            val prevAddress = addresses(address)
-            addresses.put(address, (prevAddress._1 - iEb.box.value, prevAddress._2 - iEb.box.additionalTokens.toArray.map(_._2).sum))
-            val template = hashTreeTemplate(ExtraIndexer.getAddress(iEb.box.ergoTree)(addressEncoder).script)
-            val prevTemplate = templates(template)
-            templates.put(template, (prevTemplate._1 + 1, prevTemplate._2 - 1))
-          }
+        tx.inputs.foreach { input =>
+          val iEb: IndexedErgoBox = _history.getReader.typedExtraIndexById[IndexedErgoBox](bytesToId(input.boxId)).get
+          val address = hashErgoTree(ExtraIndexer.getAddress(iEb.box.ergoTree)(addressEncoder).script)
+          val prevAddress = addresses(address)
+          addresses.put(address, (prevAddress._1 - iEb.box.value, prevAddress._2 - iEb.box.additionalTokens.toArray.map(_._2).sum))
+          val template = hashTreeTemplate(ExtraIndexer.getAddress(iEb.box.ergoTree)(addressEncoder).script)
+          val prevTemplate = templates(template)
+          templates.put(template, (prevTemplate._1 + 1, prevTemplate._2 - 1))
         }
-        tx.outputs.foreach { output =>
-          boxesIndexed += 1
-          val address = hashErgoTree(ExtraIndexer.getAddress(output.ergoTree)(addressEncoder).script)
-          val prevAddress = addresses.getOrElse(address, (0L, 0L))
-          addresses.put(address, (prevAddress._1 + output.value, prevAddress._2 + output.additionalTokens.toArray.map(_._2).sum))
-          val template = hashTreeTemplate(ExtraIndexer.getAddress(output.ergoTree)(addressEncoder).script)
-          val prevTemplate = templates.getOrElse(template, (0L, 0L))
-          templates.put(template, (prevTemplate._1, prevTemplate._2 + 1))
-          cfor(0)(_ < output.additionalTokens.length, _ + 1) { j =>
-            val token = IndexedToken.fromBox(new IndexedErgoBox(i, None, None, None, output, 0), j)
-            val prev2 = indexedTokens.getOrElse(token.id, (0L, 0L))
-            indexedTokens.put(token.id, (prev2._1 + 1, 0))
-          }
-        }
+        tx.outputs.foreach(receive(_, i))
       }
     }
     (addresses, templates, indexedTokens, txsIndexed, boxesIndexed)
@@ -237,11 +240,9 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   }
 
   /**
-    * Ground truth for the rent index derived WITHOUT any indexer state: replay the best
-    * chain's blocks and keep the boxes that were created and never spent, assigning the
-    * global box index in output order. The genesis box is not part of the chain's blocks,
-    * so the produced indices are offset relative to `NumericBoxIndex`, which counts from
-    * the genesis box.
+    * Ground truth for the rent index derived WITHOUT any indexer state: replay the genesis
+    * boxes and the best chain's blocks and keep the boxes that were created and never spent,
+    * assigning the global box index in that order (genesis boxes first, as `NumericBoxIndex`).
     *
     * This is deliberately independent of `IndexerState` and `NumericBoxIndex`: those are
     * maintained by the indexer under test, so a systematic miscount of the rent rows
@@ -251,6 +252,10 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val created = mutable.HashMap.empty[ModifierId, (Int, Long)]
     val spent = mutable.HashSet.empty[ModifierId]
     var globalIndex = 0L
+    if (height >= 1) genesisBoxes.foreach { box =>
+      created.put(bytesToId(box.id), (box.creationHeight, globalIndex))
+      globalIndex += 1
+    }
     var h = 1
     while (h <= height) {
       history.bestHeaderIdAtHeight(h).foreach { headerId =>
@@ -298,6 +303,9 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     withClue("rent index must cover exactly the boxes unspent on the best chain: ") {
       actualIds shouldBe expected.keySet
     }
+    withClue("rent rows must carry the (creationHeight, globalIndex) of a replay of the chain: ") {
+      rentEntries.map(e => (e.creationHeight, e.globalIndex)).toSet shouldBe expected.values.toSet
+    }
 
     // creation height is part of the key, so it must match the box exactly
     rentEntries.foreach { e =>
@@ -307,9 +315,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       }
     }
 
-    // The global index cannot be compared against a chain replay: the indexer counts
-    // from the genesis box while a chain replay only sees block outputs. What matters
-    // for the range scan is that the numbering is strictly increasing in
+    // What matters for the range scan is that the numbering is strictly increasing in
     // (creationHeight, globalIndex) order, so the rows form one ascending, unique run.
     val keys = rentEntries.map(e => (e.creationHeight, e.globalIndex)).toSeq
     withClue("rent rows must be strictly ascending by (creationHeight, globalIndex): ") {
@@ -429,7 +435,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     val secondHeader = history.typedModifierById[Header](history.bestHeaderIdAtHeight(HEIGHT + 2).get).get
     val blocks = (1 to HEIGHT + 2).map(height => history.bestBlockTransactionsAt(height).get)
     val expectedTxCount = blocks.map(_.txs.size.toLong).sum
-    val expectedBoxCount = blocks.flatMap(_.txs).map(_.outputs.size.toLong).sum
+    val expectedBoxCount = genesisBoxes.size + blocks.flatMap(_.txs).map(_.outputs.size.toLong).sum
     indexer ! RemoteBlockApplied(firstHeader, history.getFullBlock(firstHeader).get.transactions.map(_.id))
     indexer ! RemoteBlockApplied(firstHeader, history.getFullBlock(firstHeader).get.transactions.map(_.id))
     indexer ! RemoteBlockApplied(secondHeader, history.getFullBlock(secondHeader).get.transactions.map(_.id))
@@ -575,8 +581,15 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
         val header = indexedHistory.bestFullBlockOpt.get.header
         val blockTransactions = indexedHistory.typedModifierById[BlockTransactions](header.transactionsId).get
         val txCount = blockTransactions.txs.size.toLong
-        val boxCount = blockTransactions.txs.map(_.outputs.size.toLong).sum
+        // the genesis boxes are numbered ahead of the outputs of block 1
+        val boxCount = genesisBoxes.size + blockTransactions.txs.map(_.outputs.size.toLong).sum
         val lastTx = blockTransactions.txs.last
+        // block 1 has the emission transaction only: its inputs are genesis boxes, spent at height 1
+        val spentInputs = lastTx.inputs.map { input =>
+          val number = genesisBoxes.indexWhere(_.id.sameElements(input.boxId))
+          assert(number >= 0, "the last transaction of block 1 spends a genesis box")
+          new IndexedErgoBox(header.height, Some(lastTx.id), Some(header.height), None, genesisBoxes(number), number)
+        }
         val lastTxIndex = txCount - 1
         val lastBoxIndex = boxCount - 1
         val outputIndexes = Array.tabulate(lastTx.outputs.size) { i =>
@@ -587,7 +600,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
           blockTransactions.txs.size - 1,
           header.height,
           lastTxIndex,
-          Array.fill(lastTx.inputs.size)(0L),
+          spentInputs.map(_.globalIndex).toArray,
           outputIndexes,
           header.id
         )
@@ -613,7 +626,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
           ExtraIndexer.RollbackToKey -> ByteBuffer.allocate(4).putInt(0).array,
           ExtraIndexer.IndexedHeaderIdKey -> ExtraIndexer.fastIdToBytes(header.id)
         )
-        val checkpointObjects = Array[ExtraIndex](numericTx, indexedTx) ++ numericBoxes ++ indexedBoxes
+        val checkpointObjects = Array[ExtraIndex](numericTx, indexedTx) ++ numericBoxes ++ indexedBoxes ++ spentInputs
         indexedHistory.historyStorage.insertExtraTry(
           checkpointMetadata,
           checkpointObjects
@@ -882,7 +895,8 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       dbSettings.cacheSettings,
       dbSettings.chainSettings.addressEncoder,
       Some(viewHolderProbe.ref),
-      true
+      true,
+      genesisBoxes
     )))
     val request = viewHolderProbe.expectMsgType[GetDataFromCurrentView[_, _]]
       .asInstanceOf[GetDataFromCurrentView[ErgoStateReader, Any]]
@@ -974,6 +988,181 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     awaitCondition(done)
     val (_, _, indexedTokens, _, _) = manualIndex(HEIGHT)
     checkTokens(indexedTokens) shouldBe 0
+    indexer ! Reset()
+  }
+
+  /** Unspent boxes after indexing up to `height`: genesis boxes and block outputs not spent by a block up to it. */
+  def unspentAt(height: Int): Seq[ErgoBox] = {
+    val txs = (1 to height).flatMap(fullChainTransactionsAt(_).txs)
+    val spent = txs.flatMap(_.inputs).map(input => bytesToId(input.boxId)).toSet
+    (genesisBoxes ++ txs.flatMap(_.outputs)).filterNot(box => spent.contains(bytesToId(box.id)))
+  }
+
+  def utxoIdsOf(tree: ModifierId): Seq[ModifierId] =
+    history.typedExtraIndexById[IndexedErgoAddress](tree).get
+      .retrieveUtxos(history, ErgoMemPool.empty(settings), 0, 10000, SortDirection.ASC, unconfirmed = false, Set.empty)
+      .map(_.id)
+
+  /**
+    * Everything a rollback and a re-index must restore, as text: checkpoint, every box and transaction row by
+    * number, the rows of every address, template and token of those boxes, and the storage-rent rows.
+    */
+  def indexSnapshot(): Seq[String] = {
+    val state = IndexerState.fromHistory(_history)
+    val indexedBoxes = (0L until state.globalBoxIndex).map(NumericBoxIndex.getBoxByNumber(history, _).get)
+    val boxRows = indexedBoxes.map { b =>
+      s"box ${b.globalIndex} ${b.id} ${b.inclusionHeight} ${b.spendingTxIdOpt} ${b.spendingHeightOpt}"
+    }
+    val txRows = (0L until state.globalTxIndex).map { n =>
+      val t = NumericTxIndex.getTxByNumber(history, n).get
+      s"tx $n ${t.id} ${t.globalIndex} ${t.height} ${t.blockId} ${t.inputNums.mkString(",")} ${t.outputNums.mkString(",")}"
+    }
+    def segmentRow(name: String, row: Segment[_]): String =
+      s"$name ${row.txCount} ${row.boxCount} ${row.retrieveTxs(history, 0, 10000).map(_.id).mkString(",")} " +
+        s"${row.retrieveBoxes(history, 0, 10000).map(_.id).mkString(",")}"
+    val addressRows = indexedBoxes.map(b => hashErgoTree(b.box.ergoTree)).distinct.sortBy(_.toString).map { id =>
+      val a = history.typedExtraIndexById[IndexedErgoAddress](id).get
+      segmentRow(s"address $id ${a.balanceInfo.map(bi => (bi.nanoErgs, bi.tokens.map(t => t._1.toString -> t._2).sorted))}", a) +
+        s" utxos ${utxoIdsOf(id).mkString(",")}"
+    }
+    val templateRows = indexedBoxes.map(b => hashTreeTemplate(b.box.ergoTree)).distinct.sortBy(_.toString).map { id =>
+      segmentRow(s"template $id", history.typedExtraIndexById[IndexedContractTemplate](id).get)
+    }
+    val tokenRows = indexedBoxes.flatMap(_.box.additionalTokens.toArray.map(t => bytesToId(t._1.toArray))).distinct.sortBy(_.toString)
+      .map { tokenId =>
+        val t = history.typedExtraIndexById[IndexedToken](IndexedTokenSerializer.uniqueId(tokenId)).get
+        segmentRow(s"token $tokenId ${t.boxId} ${t.amount} ${t.name} ${t.decimals}", t)
+      }
+    val rentRows = history.storageRentBoxesAtOrBefore(Int.MaxValue, 100000).map(e => s"rent ${e.creationHeight} ${e.globalIndex}")
+    Seq(state.toString) ++ boxRows ++ txRows ++ addressRows ++ templateRows ++ tokenRows ++ rentRows
+  }
+
+  property("genesis boxes are numbered from 0 at height 1, emission box first, ahead of block 1") {
+    indexer ! CreateDB(HEIGHT)
+    indexer ! Index()
+    awaitCondition(done)
+    val state = IndexerState.fromHistory(_history)
+    val chainTxs = (1 to HEIGHT).flatMap(fullChainTransactionsAt(_).txs)
+
+    // box number 0 is the genesis emission box: the box the emission transaction of block 1 spends
+    genesisBoxes.head.ergoTree shouldBe initSettings.chainSettings.monetary.emissionBoxProposition
+    fullChainTransactionsAt(1).txs.head.inputs.map(i => bytesToId(i.boxId)) shouldBe Seq(bytesToId(genesisBoxes.head.id))
+    NumericBoxIndex.getBoxByNumber(history, 0).map(_.id) shouldBe Some(bytesToId(genesisBoxes.head.id))
+    genesisBoxes.zipWithIndex.foreach { case (box, number) =>
+      val row = NumericBoxIndex.getBoxByNumber(history, number).get
+      row.id shouldBe bytesToId(box.id)
+      row.globalIndex shouldBe number
+      row.inclusionHeight shouldBe 1
+    }
+
+    // total counts, and contiguous numbering: genesis boxes, then the outputs of the blocks in order
+    state.globalBoxIndex shouldBe genesisBoxes.size + chainTxs.map(_.outputs.size).sum
+    state.globalTxIndex shouldBe chainTxs.size
+    (genesisBoxes ++ chainTxs.flatMap(_.outputs)).zipWithIndex.foreach { case (box, number) =>
+      val row = NumericBoxIndex.getBoxByNumber(history, number).get
+      row.id shouldBe bytesToId(box.id)
+      row.globalIndex shouldBe number
+    }
+    history.typedExtraIndexById[NumericBoxIndex](bytesToId(NumericBoxIndex.indexToBytes(state.globalBoxIndex))) shouldBe None
+    chainTxs.zipWithIndex.foreach { case (tx, number) =>
+      NumericTxIndex.getTxByNumber(history, number).map(t => t.id -> t.globalIndex) shouldBe Some(tx.id -> number)
+    }
+    history.typedExtraIndexById[NumericTxIndex](bytesToId(NumericTxIndex.indexToBytes(state.globalTxIndex))) shouldBe None
+    indexer ! Reset()
+  }
+
+  property("genesis box balances are visible from height 1") {
+    indexer ! CreateDB(HEIGHT)
+    indexer ! Index()
+    awaitCondition(done)
+    val unspent = unspentAt(HEIGHT)
+    val unspentIds = unspent.map(b => bytesToId(b.id)).toSet
+    val unspentGenesis = genesisBoxes.filter(b => unspentIds.contains(bytesToId(b.id)))
+    unspentGenesis should not be empty // the no-premine and founders boxes are never spent by the test chain
+    unspentGenesis.foreach { box =>
+      history.typedExtraIndexById[IndexedErgoBox](bytesToId(box.id)).map(_.isSpent) shouldBe Some(false)
+      val tree = hashErgoTree(box.ergoTree)
+      history.typedExtraIndexById[IndexedErgoAddress](tree).flatMap(_.balanceInfo).map(_.nanoErgs) shouldBe
+        Some(unspent.filter(b => hashErgoTree(b.ergoTree) == tree).map(_.value).sum)
+      utxoIdsOf(tree) should contain(bytesToId(box.id))
+    }
+    // manual count, genesis boxes included
+    val (addresses, templates, indexedTokens, txsIndexed, boxesIndexed) = manualIndex(HEIGHT)
+    checkAddresses(addresses) shouldBe 0
+    checkTemplates(templates) shouldBe 0
+    checkTokens(indexedTokens) shouldBe 0
+    IndexerState.fromHistory(_history).globalTxIndex shouldBe txsIndexed
+    IndexerState.fromHistory(_history).globalBoxIndex shouldBe boxesIndexed
+    checkRentIndexAgainstChain(HEIGHT)
+    indexer ! Reset()
+  }
+
+  property("spending a genesis box records the right input and updates its address") {
+    indexer ! CreateDB(HEIGHT)
+    indexer ! Index()
+    awaitCondition(done)
+    val emissionTx = fullChainTransactionsAt(1).txs.head
+    val genesisEmission = genesisBoxes.head
+    val genesisEmissionId = bytesToId(genesisEmission.id)
+
+    // shape only: 0 is also the value of an unresolved input. The spent markers below prove the input was resolved
+    val txRow = history.typedExtraIndexById[IndexedErgoTransaction](emissionTx.id).get
+    txRow.inputNums.toSeq shouldBe Seq(0L)
+    txRow.retrieveBody(history).inputs.map(_.id) shouldBe Seq(genesisEmissionId)
+
+    // the genesis box is spent by it, at height 1, and is no longer unspent anywhere
+    val boxRow = history.typedExtraIndexById[IndexedErgoBox](genesisEmissionId).get
+    boxRow.spendingTxIdOpt shouldBe Some(emissionTx.id)
+    boxRow.spendingHeightOpt shouldBe Some(1)
+    val tree = hashErgoTree(genesisEmission.ergoTree)
+    utxoIdsOf(tree) should not contain genesisEmissionId
+    history.storageRentBoxesAtOrBefore(Int.MaxValue, 100000).map(_.globalIndex) should not contain 0L
+
+    // the address holds what is unspent at it, and lists the spending transaction
+    val address = history.typedExtraIndexById[IndexedErgoAddress](tree).get
+    address.balanceInfo.map(_.nanoErgs) shouldBe Some(unspentAt(HEIGHT).filter(b => hashErgoTree(b.ergoTree) == tree).map(_.value).sum)
+    address.retrieveTxs(history, 0, 10000).map(_.id) should contain(emissionTx.id)
+    address.retrieveBoxes(history, 0, 10000).map(_.id) should contain(genesisEmissionId)
+    indexer ! Reset()
+  }
+
+  property("rollback to height 1 keeps the genesis boxes, and re-indexing restores the same index") {
+    indexer ! CreateDB(HEIGHT)
+    indexer ! Index()
+    awaitCondition(done)
+    val before = indexSnapshot()
+
+    indexer ! ForceRollback(1)
+    awaitCondition(done)
+    val atOne = IndexerState.fromHistory(_history)
+    val block1 = fullChainTransactionsAt(1).txs
+    atOne.indexedHeight shouldBe 1
+    atOne.globalTxIndex shouldBe block1.size
+    atOne.globalBoxIndex shouldBe genesisBoxes.size + block1.map(_.outputs.size).sum
+    genesisBoxes.zipWithIndex.foreach { case (box, number) =>
+      NumericBoxIndex.getBoxByNumber(history, number).map(_.id) shouldBe Some(bytesToId(box.id))
+    }
+    // spent by block 1, which stays: still spent; the others: unspent, with their balances
+    history.typedExtraIndexById[IndexedErgoBox](bytesToId(genesisBoxes.head.id)).flatMap(_.spendingHeightOpt) shouldBe Some(1)
+    val unspent = unspentAt(1)
+    val unspentIds = unspent.map(b => bytesToId(b.id)).toSet
+    genesisBoxes.filter(b => unspentIds.contains(bytesToId(b.id))).foreach { box =>
+      val tree = hashErgoTree(box.ergoTree)
+      history.typedExtraIndexById[IndexedErgoAddress](tree).flatMap(_.balanceInfo).map(_.nanoErgs) shouldBe
+        Some(unspent.filter(b => hashErgoTree(b.ergoTree) == tree).map(_.value).sum)
+    }
+    val (addresses, templates, indexedTokens, _, _) = manualIndex(1)
+    checkAddresses(addresses) shouldBe 0
+    checkTemplates(templates) shouldBe 0
+    checkTokens(indexedTokens) shouldBe 0
+    checkRentIndexAgainstChain(1)
+
+    // re-indexing the same blocks gives the same index: nothing about the genesis boxes is counted twice
+    indexer ! Index()
+    org.ergoplatform.utils.untilTimeout(60.seconds, 100.millis) {
+      IndexerState.fromHistory(_history).indexedHeight shouldBe HEIGHT
+    }
+    indexSnapshot() shouldBe before
     indexer ! Reset()
   }
 
@@ -1153,13 +1342,14 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       history.typedModifierById[Header](indexedTip.id) shouldBe None
       _history.historyStorage.modifierById(indexedTip.id) shouldBe Some(indexedTip)
       val expectedTransactions = (1 to HEIGHT + 1).flatMap(fullChainTransactionsAt(_).txs)
-      val expectedBoxes = expectedTransactions.flatMap(_.outputs)
+      val expectedBoxes = genesisBoxes ++ expectedTransactions.flatMap(_.outputs)
 
       val restartedIndexer = system.actorOf(Props(new ExtraIndexer(
         initSettings.cacheSettings,
         initSettings.chainSettings.addressEncoder,
         None,
-        true
+        true,
+        genesisBoxes
       )))
       val probe = TestProbe()(system)
       probe.watch(restartedIndexer)
@@ -1220,7 +1410,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       IndexerState.fromHistory(_history).indexedHeaderId shouldBe Some(indexedTip.id)
 
       val expectedTransactions = (1 until HEIGHT).flatMap(fullChainTransactionsAt(_).txs)
-      val expectedBoxes = expectedTransactions.flatMap(_.outputs)
+      val expectedBoxes = genesisBoxes ++ expectedTransactions.flatMap(_.outputs)
       val probe = TestProbe()(system)
       probe.watch(indexer)
       probe.send(indexer, Rollback(selectedTip.id))
@@ -1363,7 +1553,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     history.typedExtraIndexById[IndexedErgoTransaction](branchPointLastTx.id) shouldBe None
 
     val expectedTransactions = (1 to HEIGHT + 2).flatMap(fullChainTransactionsAt(_).txs)
-    val expectedBoxes = expectedTransactions.flatMap(_.outputs)
+    val expectedBoxes = genesisBoxes ++ expectedTransactions.flatMap(_.outputs)
     val eventProbe = TestProbe()(system)
     eventProbe.send(indexer, GetLoadedState())
     val beforeEvent = eventProbe.expectMsgType[IndexerState]
@@ -1444,7 +1634,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     }
 
     val expectedTransactions = (1 to HEIGHT + 1).flatMap(fullChainTransactionsAt(_).txs)
-    val expectedBoxes = expectedTransactions.flatMap(_.outputs)
+    val expectedBoxes = genesisBoxes ++ expectedTransactions.flatMap(_.outputs)
     val state = IndexerState.fromHistory(_history)
     state.globalTxIndex shouldBe expectedTransactions.size
     state.globalBoxIndex shouldBe expectedBoxes.size
@@ -1913,7 +2103,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     }
 
     val expectedTransactions = (1 to HEIGHT + 1).flatMap(fullChainTransactionsAt(_).txs)
-    val expectedBoxes = expectedTransactions.flatMap(_.outputs)
+    val expectedBoxes = genesisBoxes ++ expectedTransactions.flatMap(_.outputs)
     val state = IndexerState.fromHistory(_history)
     state.globalTxIndex shouldBe expectedTransactions.size
     state.globalBoxIndex shouldBe expectedBoxes.size

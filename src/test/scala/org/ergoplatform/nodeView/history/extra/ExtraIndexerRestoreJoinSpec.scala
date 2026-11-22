@@ -3,7 +3,7 @@ package org.ergoplatform.nodeView.history.extra
 import akka.actor.Props
 import org.ergoplatform.consensus.ModifierSemanticValidity
 import org.ergoplatform.core.idToVersion
-import org.ergoplatform.nodeView.state.StateType
+import org.ergoplatform.nodeView.state.{ErgoState, StateType}
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.utils.fixtures.NodeViewFixture
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.{createUtxoState, validFullBlock}
@@ -53,7 +53,8 @@ class ExtraIndexerRestoreJoinSpec extends ErgoCorePropertyTest with NodeViewTest
           settings.cacheSettings,
           settings.chainSettings.addressEncoder,
           Some(nodeViewHolderRef),
-          true
+          true,
+          ErgoState.genesisBoxes(settings.chainSettings)
         )))
         try {
           org.ergoplatform.utils.untilTimeout(10.seconds, 50.millis) {

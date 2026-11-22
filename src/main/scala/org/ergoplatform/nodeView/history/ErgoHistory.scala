@@ -318,9 +318,8 @@ object ErgoHistory extends ScorexLogging {
               val lastTxIndex = globalTxIndex - 1
               val firstTxBoxIndex = globalBoxIndex - lastTx.outputs.size
               val expectedOutputNums = Array.tabulate(lastTx.outputs.size)(i => firstTxBoxIndex + i)
-              val expectedInputNumsOpt = if (header.height <= 1) {
-                Some(Array.fill[Long](lastTx.inputs.size)(0L))
-              } else {
+              // inputs are resolved at every height: the genesis boxes block 1 spends are indexed too
+              val expectedInputNumsOpt = {
                 val inputNums = lastTx.inputs.map { input =>
                   val inputId = bytesToId(input.boxId)
                   db.getExtraIndex(inputId).collect {

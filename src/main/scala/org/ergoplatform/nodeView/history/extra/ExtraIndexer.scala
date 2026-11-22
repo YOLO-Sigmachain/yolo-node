@@ -1,7 +1,7 @@
 package org.ergoplatform.nodeView.history.extra
 
 import akka.actor.{Actor, ActorRef, ActorSystem, Props, Stash, Timers}
-import org.ergoplatform.{ErgoAddress, ErgoAddressEncoder, GlobalConstants, Pay2SAddress}
+import org.ergoplatform.{ErgoAddress, ErgoAddressEncoder, ErgoBox, GlobalConstants, Pay2SAddress}
 import org.ergoplatform.core.{VersionTag, versionToId}
 import org.ergoplatform.modifiers.history.BlockTransactions
 import org.ergoplatform.modifiers.history.header.Header
@@ -17,7 +17,7 @@ import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hash
 import org.ergoplatform.nodeView.history.extra.IndexedTokenSerializer.uniqueId
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.nodeView.history.storage.modifierprocessors.FullBlockProcessor
-import org.ergoplatform.nodeView.state.ErgoStateReader
+import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateReader}
 import org.ergoplatform.settings.{Algos, CacheSettings, ChainSettings}
 import scorex.util.{ModifierId, ScorexLogging, bytesToId}
 import sigma.ast.ErgoTree
@@ -63,6 +63,12 @@ trait ExtraIndexerBase extends Actor with Stash with Timers with ScorexLogging {
     * Address encoder instance
     */
   protected implicit val addressEncoder: ErgoAddressEncoder
+
+  /**
+    * Genesis state boxes (`ErgoState.genesisBoxes`), emission box first. They are in no block, so the
+    * indexer indexes them at height 1, ahead of the transactions of block 1 (see [[indexGenesisBoxes]]).
+    */
+  protected def genesisBoxes: Seq[ErgoBox]
 
   /**
     * Database handle
@@ -310,25 +316,29 @@ trait ExtraIndexerBase extends Actor with Stash with Timers with ScorexLogging {
     *
     * @param id             - hash of the (ergotree) address
     * @param spendOrReceive - IndexedErgoBox to receive (Right) or spend (Left)
+    * @param recordTx       - whether to record the current transaction number for the address; false for a
+    *                         genesis box, which no transaction creates
     */
-  private def findAndUpdateTree(id: ModifierId, spendOrReceive: Either[IndexedErgoBox, IndexedErgoBox])(state: IndexerState): Unit = {
+  private def findAndUpdateTree(id: ModifierId, spendOrReceive: Either[IndexedErgoBox, IndexedErgoBox])
+                               (state: IndexerState, recordTx: Boolean = true): Unit = {
+    def withTx(tree: IndexedErgoAddress): IndexedErgoAddress = if (recordTx) tree.addTx(state.globalTxIndex) else tree
     trees.get(id).map { tree =>
       spendOrReceive match {
-        case Left(iEb) => tree.addTx(state.globalTxIndex).spendBox(iEb, Some(history)) // spend box
-        case Right(iEb) => tree.addTx(state.globalTxIndex).addBox(iEb) // receive box
+        case Left(iEb) => withTx(tree).spendBox(iEb, Some(history)) // spend box
+        case Right(iEb) => withTx(tree).addBox(iEb) // receive box
       }
       return
     }
     history.typedExtraIndexById[IndexedErgoAddress](id) match { // address not found in last saveLimit modifiers
       case Some(x) =>
         spendOrReceive match {
-          case Left(iEb) => trees.put(id, x.addTx(state.globalTxIndex).spendBox(iEb, Some(history))) // spend box
-          case Right(iEb) => trees.put(id, x.addTx(state.globalTxIndex).addBox(iEb)) // receive box
+          case Left(iEb) => trees.put(id, withTx(x).spendBox(iEb, Some(history))) // spend box
+          case Right(iEb) => trees.put(id, withTx(x).addBox(iEb)) // receive box
         }
       case None => // address not found at all
         spendOrReceive match {
           case Left(iEb) => log.error(s"Unknown address spent box ${bytesToId(iEb.box.id)}") // spend box should never happen by an unknown address
-          case Right(iEb) => trees.put(id, IndexedErgoAddress(id).initBalance.addTx(state.globalTxIndex).addBox(iEb)) // receive box, new address
+          case Right(iEb) => trees.put(id, withTx(IndexedErgoAddress(id).initBalance).addBox(iEb)) // receive box, new address
         }
     }
   }
@@ -446,6 +456,58 @@ trait ExtraIndexerBase extends Actor with Stash with Timers with ScorexLogging {
   }
 
   /**
+    * Buffer a new box with number `state.globalBoxIndex`: its row, its number row, its storage-rent row, and
+    * its entries in the address and template rows. Tokens are left to the caller.
+    *
+    * @param recordTx - whether the address row records the current transaction number (no for a genesis box)
+    * @return the buffered box
+    */
+  private def indexNewBox(box: ErgoBox, height: Int, state: IndexerState, recordTx: Boolean): IndexedErgoBox = {
+    val iEb: IndexedErgoBox = new IndexedErgoBox(height, None, None, None, box, state.globalBoxIndex)
+    boxes.put(iEb.id, iEb) // box by id
+    general += NumericBoxIndex(state.globalBoxIndex, iEb.id) // box id by global box number
+
+    // unspent box by creation height (storage-rent eligibility index)
+    if (rentIndexEnabled) {
+      val srb = StorageRentBox(iEb)
+      rentBoxes.put(srb.id, srb)
+    }
+
+    // box by address
+    findAndUpdateTree(hashErgoTree(iEb.box.ergoTree), Right(iEb))(state, recordTx)
+
+    // box by template
+    findAndUpdateTemplate(hashTreeTemplate(iEb.box.ergoTree), Right(iEb))
+    iEb
+  }
+
+  /**
+    * Buffer the genesis boxes as boxes included at `height` (1), numbered from `state.globalBoxIndex` (0) in
+    * `genesisBoxes` order, emission box first. No transaction creates them: the address rows record no
+    * transaction for them, and the tokens they hold, which no transaction mints, get their rows here
+    * (see [[ExtraIndexer.genesisToken]]).
+    *
+    * @return the state with the box count advanced past the genesis boxes
+    */
+  private def indexGenesisBoxes(state: IndexerState, height: Int): IndexerState = {
+    var newState = state
+    genesisBoxes.foreach { box =>
+      val iEb = indexNewBox(box, height, newState, recordTx = false)
+      cfor(0)(_ < iEb.box.additionalTokens.length, _ + 1) { j =>
+        val token = genesisToken(iEb, j)
+        tokens.get(token.tokenId) match {
+          case Some(t) => tokens.put(token.tokenId, t.addEmissionAmount(token.amount.get)) // in several genesis boxes
+          case None => tokens.put(token.tokenId, token)
+        }
+        findAndUpdateToken(token.tokenId, Right(iEb))
+      }
+      newState = newState.incrementBoxIndex
+    }
+    if (genesisBoxes.nonEmpty) log.info(s"Buffered ${genesisBoxes.length} genesis boxes at height $height")
+    newState
+  }
+
+  /**
     * Process a batch of BlockTransactions into memory and occasionally write them to database.
     *
     * @param state     - current indexer state
@@ -468,6 +530,12 @@ trait ExtraIndexerBase extends Actor with Stash with Timers with ScorexLogging {
     var boxCount: Int = 0
     var newState: IndexerState = state
 
+    // the genesis boxes come first, so block 1 can spend them and the emission box is box number 0
+    if (height == 1) {
+      newState = indexGenesisBoxes(newState, height)
+      boxCount += genesisBoxes.length
+    }
+
     // record transactions and boxes
     cfor(0)(_ < txs.length, _ + 1) { n =>
 
@@ -478,43 +546,27 @@ trait ExtraIndexerBase extends Actor with Stash with Timers with ScorexLogging {
       inputTokens.clear()
 
       //process transaction inputs
-      if (height > 1) { //only after 1st block (skip genesis box)
-        cfor(0)(_ < tx.inputs.size, _ + 1) { i =>
-          val boxId = bytesToId(tx.inputs(i).boxId)
-          val spendingProof = tx.inputs(i).spendingProof
-          if (findAndSpendBox(boxId, tx.id, height, spendingProof)) { // spend box and add tx
-            val iEb = boxes(boxId)
-            markRentBoxSpent(iEb)
-            findAndUpdateTree(hashErgoTree(iEb.box.ergoTree), Left(iEb))(newState)
-            findAndUpdateTemplate(hashTreeTemplate(iEb.box.ergoTree), Left(iEb))
-              cfor(0)(_ < iEb.box.additionalTokens.length, _ + 1) { j =>
-              findAndUpdateToken(iEb.box.additionalTokens(j)._1.toModifierId, Left(iEb))
-            }
-            inputs(i) = iEb.globalIndex
-          } else {
-            log.warn(s"Not found input box: $boxId")
+      cfor(0)(_ < tx.inputs.size, _ + 1) { i =>
+        val boxId = bytesToId(tx.inputs(i).boxId)
+        val spendingProof = tx.inputs(i).spendingProof
+        if (findAndSpendBox(boxId, tx.id, height, spendingProof)) { // spend box and add tx
+          val iEb = boxes(boxId)
+          markRentBoxSpent(iEb)
+          findAndUpdateTree(hashErgoTree(iEb.box.ergoTree), Left(iEb))(newState)
+          findAndUpdateTemplate(hashTreeTemplate(iEb.box.ergoTree), Left(iEb))
+            cfor(0)(_ < iEb.box.additionalTokens.length, _ + 1) { j =>
+            findAndUpdateToken(iEb.box.additionalTokens(j)._1.toModifierId, Left(iEb))
           }
+          inputs(i) = iEb.globalIndex
+        } else {
+          log.warn(s"Not found input box: $boxId")
         }
       }
 
       //process transaction outputs
       cfor(0)(_ < tx.outputs.size, _ + 1) { i =>
-        val iEb: IndexedErgoBox = new IndexedErgoBox(height, None, None, None, tx.outputs(i), newState.globalBoxIndex)
-        boxes.put(iEb.id, iEb) // box by id
-        general += NumericBoxIndex(newState.globalBoxIndex, iEb.id) // box id by global box number
+        val iEb: IndexedErgoBox = indexNewBox(tx.outputs(i), height, newState, recordTx = true)
         outputs(i) = iEb.globalIndex
-
-        // unspent box by creation height (storage-rent eligibility index)
-        if (rentIndexEnabled) {
-          val srb = StorageRentBox(iEb)
-          rentBoxes.put(srb.id, srb)
-        }
-
-        // box by address
-        findAndUpdateTree(hashErgoTree(iEb.box.ergoTree), Right(boxes(iEb.id)))(newState)
-
-        // box by template
-        findAndUpdateTemplate(hashTreeTemplate(iEb.box.ergoTree), Right(boxes(iEb.id)))
 
         // check if box is creating new tokens, if yes record them
         cfor(0)(_ < iEb.box.additionalTokens.length, _ + 1) { j =>
@@ -880,11 +932,13 @@ trait ExtraIndexerBase extends Actor with Stash with Timers with ScorexLogging {
   * @param ae                - ergo address encoder to use for handling addresses
   * @param rentIndexEnabled  - whether to maintain the storage-rent eligibility index
   *                            (`storageRentCollection` setting)
+  * @param genesisBoxes      - genesis state boxes, `ErgoState.genesisBoxes` of the chain, emission box first
   */
 class ExtraIndexer(cacheSettings: CacheSettings,
                    ae: ErgoAddressEncoder,
                    nodeViewHolderRefOpt: Option[ActorRef],
-                   override protected val rentIndexEnabled: Boolean)
+                   override protected val rentIndexEnabled: Boolean,
+                   override protected val genesisBoxes: Seq[ErgoBox])
   extends ExtraIndexerBase {
 
   override val saveLimit: Int = cacheSettings.history.extraCacheSize * 20
@@ -970,6 +1024,21 @@ object ExtraIndexer {
   }
 
   /**
+    * Token row of a token held by a genesis box: created by that box,
+    * with the amount it holds, and no name, description or decimals - the registers of the genesis boxes are
+    * contract state, not token metadata. No transaction mints these tokens (genesis boxes are inserted into the
+    * state directly), so the indexer writes the row when it indexes the genesis boxes, in the same batch as them
+    * and block 1; a rollback keeps it (the genesis boxes stay), and a rebuild writes it again.
+    *
+    * @param iEb        - indexed genesis box
+    * @param tokenIndex - index of the token in the box's `additionalTokens`
+    */
+  def genesisToken(iEb: IndexedErgoBox, tokenIndex: Int): IndexedToken = {
+    val (tokenId, amount) = iEb.box.additionalTokens(tokenIndex)
+    IndexedToken(bytesToId(tokenId.toArray), Some(iEb.id), Some(amount), Some(""), Some(""), Some(0))
+  }
+
+  /**
     * @return address constructed from the ErgoTree of this box
     */
   def getAddress(tree: ErgoTree)(implicit ae: ErgoAddressEncoder): ErgoAddress =
@@ -1003,8 +1072,9 @@ object ExtraIndexer {
 
   /**
     * Current newest database schema version. Used to force extra database resync.
+    * 8: genesis boxes are indexed (box numbers start with them) and block 1 inputs are resolved.
     */
-  val NewestVersion: Int = 7
+  val NewestVersion: Int = 8
   val NewestVersionBytes: Array[Byte] = ByteBuffer.allocate(4).putInt(NewestVersion).array
 
   val IndexedHeightKey: Array[Byte] = Algos.hash("indexed height")
@@ -1049,7 +1119,8 @@ object ExtraIndexer {
   def apply(chainSettings: ChainSettings,
             cacheSettings: CacheSettings,
             nodeViewHolderRef: ActorRef)(implicit system: ActorSystem, rentIndexEnabled: Boolean): ActorRef = {
-    val props = Props(new ExtraIndexer(cacheSettings, chainSettings.addressEncoder, Some(nodeViewHolderRef), rentIndexEnabled))
+    val props = Props(new ExtraIndexer(cacheSettings, chainSettings.addressEncoder, Some(nodeViewHolderRef), rentIndexEnabled,
+      ErgoState.genesisBoxes(chainSettings)))
     system.actorOf(props.withDispatcher(GlobalConstants.IndexerDispatcher))
   }
 }

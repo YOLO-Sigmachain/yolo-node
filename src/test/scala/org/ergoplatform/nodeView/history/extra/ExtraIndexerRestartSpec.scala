@@ -8,7 +8,7 @@ import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.nodeView.history.ErgoHistory
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.CurrentView
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
-import org.ergoplatform.nodeView.state.ErgoStateReader
+import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateReader}
 import org.ergoplatform.settings.{CacheSettings, NetworkType}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.createDigestState
@@ -26,7 +26,8 @@ class ExtraIndexerRestartSpec extends ErgoCorePropertyTest with TestFileUtils {
   private class RestartProbeIndexer(cacheSettings: CacheSettings,
                                     addressEncoder: ErgoAddressEncoder,
                                     nodeViewHolderRef: ActorRef)
-    extends ExtraIndexer(cacheSettings, addressEncoder, Some(nodeViewHolderRef), true) {
+    extends ExtraIndexer(cacheSettings, addressEncoder, Some(nodeViewHolderRef), true,
+      ErgoState.genesisBoxes(baseSettings.chainSettings)) {
     override def receive: Receive = super.receive.orElse {
       case IsInitialized => sender() ! (_history ne null)
       case FailOnce => throw new IllegalStateException("injected actor failure")

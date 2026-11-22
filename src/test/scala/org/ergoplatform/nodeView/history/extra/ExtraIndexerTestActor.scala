@@ -21,9 +21,19 @@ import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
 import scala.util.{Failure, Try}
 
+/**
+  * @param extraGenesisBoxes - boxes the indexer takes as genesis boxes after those of the chain (which are
+  *                            `ErgoState.genesisBoxes` of the test settings); they are in no state, so only
+  *                            index-level checks hold for them (used to index genesis boxes holding tokens)
+  */
 class ExtraIndexerTestActor(test: ExtraIndexerSpecification,
-                            override protected val rentIndexEnabled: Boolean = true)
+                            override protected val rentIndexEnabled: Boolean,
+                            extraGenesisBoxes: Seq[ErgoBox])
   extends ExtraIndexerBase with FileUtils {
+
+  def this(test: ExtraIndexerSpecification, rentIndexEnabled: Boolean) = this(test, rentIndexEnabled, Seq.empty)
+
+  override protected val genesisBoxes: Seq[ErgoBox] = test.genesisBoxes ++ extraGenesisBoxes
 
   override def receive: Receive = {
     case test.CreateDB(blockCount: Int) => createDB(blockCount)

@@ -19,7 +19,7 @@ import org.ergoplatform.nodeView.history.extra.IndexedContractTemplateSerializer
 import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hashErgoTree
 import org.ergoplatform.nodeView.history.extra.IndexedTokenSerializer.uniqueId
 import org.ergoplatform.nodeView.history.extra.SegmentSerializer.boxSegmentId
-import org.ergoplatform.nodeView.state.{ErgoStateReader, StateType, UtxoStateReader}
+import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateReader, StateType, UtxoStateReader}
 import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
 import org.ergoplatform.settings.{Algos, ErgoSettings}
 import org.ergoplatform.utils.fixtures.NodeViewFixture
@@ -152,16 +152,16 @@ class ExtraIndexerAppliedBlocksSpec extends ErgoCorePropertyTest with NodeViewTe
 
     val txs: Seq[(ErgoTransaction, ErgoFullBlock)] = chain.flatMap(block => block.blockTransactions.txs.map(_ -> block))
     val txIds: Set[ModifierId] = txs.map(_._1.id).toSet
-    val created: Seq[ErgoBox] = txs.flatMap(_._1.outputs)
+    // the genesis boxes are numbered first, then the outputs of the blocks
+    val genesis: Seq[ErgoBox] = ErgoState.genesisBoxes(indexedSettings.chainSettings)
+    val created: Seq[ErgoBox] = genesis ++ txs.flatMap(_._1.outputs)
     val createdIds: Set[ModifierId] = created.map(box => bytesToId(box.id)).toSet
     val spentOnChain: Set[ModifierId] = txs.flatMap(tx => inputIds(tx._1)).toSet
-    // the indexer does not process the inputs of the block at height 1
-    val spender: Map[ModifierId, ModifierId] = txs.collect { case (tx, block) if block.header.height > 1 =>
-      inputIds(tx).map(_ -> tx.id)
-    }.flatten.toMap
-    val spendingHeight: Map[ModifierId, Int] = txs.collect { case (tx, block) if block.header.height > 1 =>
+    // the inputs of every block are resolved, those of block 1 (genesis boxes) included
+    val spender: Map[ModifierId, ModifierId] = txs.flatMap { case (tx, _) => inputIds(tx).map(_ -> tx.id) }.toMap
+    val spendingHeight: Map[ModifierId, Int] = txs.flatMap { case (tx, block) =>
       inputIds(tx).map(_ -> block.header.height)
-    }.flatten.toMap
+    }.toMap
 
     val checkpoint = IndexerState.fromHistory(history)
     check(checkpoint.indexedHeight == chain.last.header.height && checkpoint.indexedHeaderId.contains(chain.last.id),
@@ -178,7 +178,7 @@ class ExtraIndexerAppliedBlocksSpec extends ErgoCorePropertyTest with NodeViewTe
             s"transaction ${tx.id} is #$number in block ${block.id} at height ${block.header.height}, " +
               s"its row says #${row.globalIndex} in block ${row.blockId} at height ${row.height}")
           val rowInputs = Try(row.retrieveBody(history).inputs.map(_.id))
-          check(block.header.height == 1 || rowInputs.toOption.contains(inputIds(tx)),
+          check(rowInputs.toOption.contains(inputIds(tx)),
             s"transaction ${tx.id} spends ${inputIds(tx)}, its row resolves to $rowInputs")
         case None =>
           diffs += s"transaction ${tx.id} of block ${block.id} has no row"
@@ -285,7 +285,8 @@ class ExtraIndexerAppliedBlocksSpec extends ErgoCorePropertyTest with NodeViewTe
     val indexerRestarts = new AtomicInteger(0)
 
     private val indexerOpt: Option[ActorRef] = if (startIndexer) Some(actorSystem.actorOf(Props(
-      new ExtraIndexer(settings.cacheSettings, settings.chainSettings.addressEncoder, Some(nodeViewHolderRef), true) {
+      new ExtraIndexer(settings.cacheSettings, settings.chainSettings.addressEncoder, Some(nodeViewHolderRef), true,
+        ErgoState.genesisBoxes(settings.chainSettings)) {
         override def preRestart(reason: Throwable, message: Option[Any]): Unit = {
           indexerRestarts.incrementAndGet()
           super.preRestart(reason, message)
@@ -658,7 +659,8 @@ class ExtraIndexerAppliedBlocksSpec extends ErgoCorePropertyTest with NodeViewTe
       def startIndexerAt(applied: ErgoFullBlock): ActorRef = {
         val viewHolder = TestProbe()
         val indexer = actorSystem.actorOf(Props(
-          new ExtraIndexer(settings.cacheSettings, settings.chainSettings.addressEncoder, Some(viewHolder.ref), true)))
+          new ExtraIndexer(settings.cacheSettings, settings.chainSettings.addressEncoder, Some(viewHolder.ref), true,
+            ErgoState.genesisBoxes(settings.chainSettings))))
         val request = viewHolder.expectMsgType[GetDataFromCurrentView[_, _]].asInstanceOf[GetDataFromCurrentView[ErgoStateReader, Any]]
         val state = createDigestState(idToVersion(applied.id), applied.header.stateRoot)
         try viewHolder.send(indexer, request.f(CurrentView[ErgoStateReader](history, state, null, null)))
