@@ -84,11 +84,12 @@ case class ChainSettings(protocolVersion: Byte,
 
   /**
     * Whether validation rule 308 (`bsStorageRentAttestation`) applies to a block of version `blockVersion`.
-    * Upstream: from `Header.StorageRentAttestationVersion` on. Used both by the validator (`ErgoState.execTransactions`) and by the
+    * Upstream: from `Header.StorageRentAttestationVersion` on. With the YOLO switch on, the rule applies from
+    * genesis, whatever the block version. Used both by the validator (`ErgoState.execTransactions`) and by the
     * candidate generator (`CandidateGenerator.storageRentAttestation`), so producer and validator agree.
     */
   def storageRentAttestationRequired(blockVersion: Byte): Boolean =
-    blockVersion >= Header.StorageRentAttestationVersion
+    yolo.enabled || blockVersion >= Header.StorageRentAttestationVersion
 
   /**
     * Header version of the genesis block. Upstream: `Header.InitialVersion` (1), so the genesis header is solved

@@ -3,29 +3,31 @@ package org.ergoplatform.mining
 import org.ergoplatform.consensus.ProgressInfo
 import org.ergoplatform.mining.difficulty.DifficultySerializer
 import org.ergoplatform.modifiers.history.BlockTransactions
-import org.ergoplatform.modifiers.history.extension.Extension
+import org.ergoplatform.modifiers.history.extension.{Extension, ExtensionCandidate}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.history.popow.NipopowAlgos
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, NonHeaderBlockSection}
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
+import org.ergoplatform.nodeView.history.extra.{ExtraIndex, ExtraIndexer, IndexedErgoBox, NumericBoxIndex, StorageRentBox}
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.nodeView.state.UtxoState
 import org.ergoplatform.settings.Constants.{FalseTree, TrueTree}
-import org.ergoplatform.settings.{ErgoSettings, ErgoValidationSettingsUpdate}
+import org.ergoplatform.settings.{ErgoSettings, ErgoValidationSettingsUpdate, YoloSettings}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, StorageRentTestHelpers}
 import org.ergoplatform.{ErgoBox, Input}
 import scorex.util.{ModifierId, bytesToId}
 import sigma.interpreter.ProverResult
 
+import java.nio.ByteBuffer
 import scala.reflect.ClassTag
-import scala.util.{Success, Try}
+import scala.util.{Failure, Success, Try}
 
 /**
   * Candidate assembly under EIP-0052 on miner attestation of rent-claim transactions (rule
   * `bsStorageRentAttestation`): `CandidateGenerator.createCandidate` adds the attestation field, over the rent-claim
-  * transactions of the candidate in block order, to the candidate's extension from block version 5 on,
-  * and adds no field when the candidate has no rent claim or the rule does not apply. The
+  * transactions of the candidate in block order, to the candidate's extension from block version 5 on (from genesis
+  * with the YOLO switch on), and adds no field when the candidate has no rent claim or the rule does not apply. The
   * generated candidate, proven with the test PoW scheme, is applied as a full block to the UTXO state it was built on.
   *
   * Named apart from `CandidateGeneratorStorageRentSpec`, which covers the v6.0.8 storage rent collection wiring.
@@ -165,6 +167,79 @@ class CandidateGeneratorRentAttestationSpec extends ErgoCorePropertyTest with St
     block4.transactions.tail shouldBe Seq(plainTx, claimTx, crossingTx)
     attestationValues(block4.extension) shouldBe empty
     us4.applyModifier(fb4, None)(_ => ()) shouldBe a[Success[_]]
+  }
+
+  property("yoloSelfCollection: with the YOLO switch on and storageRentCollection, at block version 4, the " +
+    "candidate's extension attests to the node's own rent claim (built by StorageRentClaimBuilder from the extra " +
+    "index) and to a mempool claim, in block order, and the proven candidate applies; without the field the same " +
+    "block is rejected by rule 308") {
+    val yoloSettings: ErgoSettings = rentSettings.copy(
+      chainSettings = rentSettings.chainSettings.copy(yolo = YoloSettings(enabled = true)),
+      nodeSettings = rentSettings.nodeSettings.copy(storageRentCollection = true, extraIndex = true))
+    val version = Header.Interpreter60Version
+    version < Header.StorageRentAttestationVersion shouldBe true
+    yoloSettings.chainSettings.storageRentAttestationRequired(version) shouldBe true
+    rentSettings.chainSettings.storageRentAttestationRequired(version) shouldBe false
+
+    val plain = boxAt(TrueTree, tip - 10, seed = 41)
+    // swept by the node itself: indexed in the extra index below, with its rent eligibility entry
+    val ownExpired = boxAt(TrueTree, nextHeight - StoragePeriod - 20, seed = 42)
+    // claimed by a mempool transaction; `false` script, so valid only through the rent branch
+    val poolExpired = boxAt(FalseTree, nextHeight - StoragePeriod - 30, seed = 43)
+    val boxes = Seq(plain, ownExpired, poolExpired)
+
+    val plainTx = ErgoTransaction(IndexedSeq(Input(plain.id, ProverResult.empty)), IndexedSeq(recreated(plain, nextHeight)))
+    val poolClaim = rentShapedTx(poolExpired, nextHeight)
+
+    // One context for both states, so that both have the same last header (the candidate's parent).
+    // No emission box: the YOLO emission inputs are not set in these settings
+    val ctx = stateContext(tip, version, yoloSettings, validationSettingsNoIl)
+    val us = utxoStateAt(boxes, None, ctx, yoloSettings)
+    val usControl = utxoStateAt(boxes, None, ctx, yoloSettings)
+    us.stateContext.simplifiedUpcoming().currentHeight shouldBe nextHeight
+    us.stateContext.blockVersion shouldBe version
+
+    // extra index synced at the tip, holding `ownExpired` and its storage rent eligibility entry
+    val storage = emptyHistoryStorage(yoloSettings)
+    val globalIndex = 7L
+    val iEb = new IndexedErgoBox(ownExpired.creationHeight, None, None, None, ownExpired, globalIndex)
+    storage.insertExtra(
+      Array(ExtraIndexer.IndexedHeightKey -> ByteBuffer.allocate(4).putInt(tip).array),
+      Array[ExtraIndex](iEb, NumericBoxIndex(globalIndex, bytesToId(ownExpired.id)), StorageRentBox(iEb)))
+    val history = historyWithBest(ctx.lastHeaderOpt.get, plainTx, yoloSettings, storage)
+
+    val (candidate, _) = CandidateGenerator.createCandidate(defaultMinerPk, history, ErgoValidationSettingsUpdate.empty,
+      us, Seq(plainTx, poolClaim).map(tx => UnconfirmedTransaction(tx, None)), None, Seq.empty, yoloSettings).get
+    val block = candidate.candidateBlock
+    block.version shouldBe version
+
+    // the node's own claim: not from the pool, spends `ownExpired`, and sits before the pool transactions
+    val ownClaim = block.transactions.find(_.inputs.exists(i => java.util.Arrays.equals(i.boxId, ownExpired.id))).get
+    ownClaim.id should not be plainTx.id
+    ownClaim.id should not be poolClaim.id
+    ErgoTransaction.hasStorageRentClaim(ownClaim, IndexedSeq(ownExpired), nextHeight) shouldBe true
+    block.transactions shouldBe Seq(ownClaim, plainTx, poolClaim)
+
+    val values = attestationValues(block.extension)
+    values.length shouldBe 1
+    java.util.Arrays.equals(values.head, attestationDigest(ownClaim, poolClaim)) shouldBe true
+    java.util.Arrays.equals(values.head,
+      CandidateGenerator.storageRentAttestation(block.transactions, us, us.stateContext.simplifiedUpcoming())
+        .fields.head._2) shouldBe true
+
+    // control: the same block without the field is rejected by rule 308
+    val unattested = block.copy(extension =
+      ExtensionCandidate(block.extension.fields.filterNot(f => java.util.Arrays.equals(f._1, AttestationKey))))
+    usControl.applyModifier(prove(unattested, yoloSettings), None)(_ => ()) match {
+      case Failure(e) => e.getMessage should include("Rent-claim transactions must be attested")
+      case Success(_) => fail("block with unattested rent claims applied on YOLO at block version 4")
+    }
+
+    // the candidate as generated is a valid block on YOLO, rule 308 included
+    val applied = us.applyModifier(prove(block, yoloSettings), None)(_ => ())
+    applied shouldBe a[Success[_]]
+    applied.get.boxById(ownExpired.id) shouldBe None
+    applied.get.boxById(poolExpired.id) shouldBe None
   }
 
 }

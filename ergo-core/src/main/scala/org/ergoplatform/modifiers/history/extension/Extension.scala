@@ -72,7 +72,8 @@ object Extension extends ApiCodecs {
   val ValidationRulesPrefix: Byte = 0x02
 
   /**
-    * From block version 5 on (see `ChainSettings.storageRentAttestationRequired`), a block containing storage rent claim transactions (transactions with at least one
+    * From block version 5 on (from genesis with the YOLO switch on, see
+    * `ChainSettings.storageRentAttestationRequired`), a block containing storage rent claim transactions (transactions with at least one
     * input satisfying `ErgoTransaction.isStorageRentClaim` at the block's height) carries a single field,
     * `storageRentClaimsKey`, in the key space defined by the value below, attesting to those transactions, and a
     * block without such transactions carries no field there (validation rule `bsStorageRentAttestation`). The

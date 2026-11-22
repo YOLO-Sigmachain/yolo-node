@@ -40,6 +40,11 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.scorexSettings.network.nodeName should startWith("yolo-")
     s.chainSettings.blockInterval shouldBe 30.seconds
     s.nodeSettings.headerChainDiff shouldBe 400
+    s.nodeSettings.rejectStorageRentTxs shouldBe true
+    // miner self-collection of storage rent, which needs the extra index
+    s.nodeSettings.storageRentCollection shouldBe true
+    s.nodeSettings.extraIndex shouldBe true
+    s.nodeSettings.isFullBlocksPruned shouldBe false
     s.chainSettings.reemission.activationHeight shouldBe Int.MaxValue
     s.chainSettings.powScheme.getClass shouldBe classOf[AutolykosPowScheme]
     s.chainSettings.powScheme.powHeightDivisor shouldBe 4
@@ -49,6 +54,9 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.chainSettings.yolo.softForkVotingStartHeight shouldBe 0
     s.chainSettings.dataInputsUniquenessHeight shouldBe 0
     s.chainSettings.storageRentDistinctOutputsActivationHeight shouldBe 0
+    // rule 308 (bsStorageRentAttestation) from genesis, whatever the block version
+    s.chainSettings.storageRentAttestationRequired(Header.InitialVersion) shouldBe true
+    s.chainSettings.storageRentAttestationRequired(Header.Interpreter60Version) shouldBe true
     s.launchParameters shouldBe YoloLaunchParameters
     // genesis header has the launch block version (4), not Header.InitialVersion: Autolykos v2 from block 1
     s.launchParameters.blockVersion shouldBe Header.Interpreter60Version

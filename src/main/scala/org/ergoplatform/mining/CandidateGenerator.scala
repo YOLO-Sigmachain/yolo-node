@@ -475,7 +475,7 @@ object CandidateGenerator extends ScorexLogging {
     * (in block order) and upcoming state context `upcomingContext`: the field `Extension.storageRentClaimsField`
     * over the ids of the storage rent claim transactions among `txs` if there is any, and no field if there is none
     * or the rule does not apply to the block version (`ChainSettings.storageRentAttestationRequired`, the same
-    * check the validator makes: from block version 5 on).
+    * check the validator makes: from block version 5 on, or from genesis with the YOLO switch on).
     */
   def storageRentAttestation(txs: Seq[ErgoTransaction],
                              s: UtxoStateReader,

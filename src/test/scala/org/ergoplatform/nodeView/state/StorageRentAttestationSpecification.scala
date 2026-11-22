@@ -6,7 +6,7 @@ import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.settings.Constants.{FalseTree, TrueTree}
 import org.ergoplatform.settings.ValidationRules.bsStorageRentAttestation
-import org.ergoplatform.settings.{ErgoValidationSettings, ErgoValidationSettingsUpdate, Parameters}
+import org.ergoplatform.settings.{ErgoSettings, ErgoValidationSettings, ErgoValidationSettingsUpdate, Parameters, YoloSettings}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, StorageRentTestHelpers}
 import org.ergoplatform.validation.ValidationResult
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
@@ -31,6 +31,9 @@ import scala.util.{Failure, Success}
   *
   * The expected field is built by `StorageRentTestHelpers.attesting`, which writes the key and the digest out as
   * the EIP specifies them, independently of `Extension.storageRentClaimsKey` / `storageRentClaimsDigest`.
+  *
+  * With the YOLO switch on, the rule applies from genesis, whatever the block version
+  * (`ChainSettings.storageRentAttestationRequired`), see the `yoloFromGenesis` cases.
   */
 class StorageRentAttestationSpecification extends ErgoCorePropertyTest with StorageRentTestHelpers {
 
@@ -478,6 +481,96 @@ class StorageRentAttestationSpecification extends ErgoCorePropertyTest with Stor
     // block-level, through the same validation as `UtxoState` and `DigestState`
     exec(Seq(spend), Seq(box), ctx4).isValid shouldBe false
     exec(Seq(spend), Seq(box), ctx5).isValid shouldBe true
+  }
+
+  // YOLO switch
+
+  private val yoloSettings: ErgoSettings =
+    rentSettings.copy(chainSettings = rentSettings.chainSettings.copy(yolo = YoloSettings(enabled = true)))
+
+  /**
+    * Full block at H with `txs` and extension fields `ext` applied to a UTXO state at H - 1 holding `boxes`, with
+    * the YOLO switch on. No emission box: the YOLO emission inputs are not set in these settings.
+    */
+  private def yoloApplyAtH(version: Byte,
+                           boxes: Seq[ErgoBox],
+                           txs: Seq[ErgoTransaction],
+                           ext: ExtensionCandidate): scala.util.Try[UtxoState] = {
+    val ctx = stateContext(H - 1, version, yoloSettings, validationSettingsNoIl)
+    val us = utxoStateAt(boxes, None, ctx, yoloSettings)
+    us.stateContext.blockVersion shouldBe version
+    us.applyModifier(blockAtH(us, version, txs, ext), None)(_ => ())
+  }
+
+  property("yoloFromGenesis: with the YOLO switch on, rule 308 applies at block versions below 5: an unattested " +
+    "rent claim, a wrong digest and a spurious field are rejected, the right field is accepted; with the switch " +
+    "off at the same block versions the rule does not apply") {
+    yoloSettings.chainSettings.yolo.enabled shouldBe true
+    rentSettings.chainSettings.yolo.enabled shouldBe false
+
+    val expiredA = boxAt(FalseTree, H - StoragePeriod, seed = 51)
+    val expiredB = boxAt(FalseTree, H - StoragePeriod - 100, seed = 52)
+    val plain = boxAt(TrueTree, H - 10, seed = 53)
+    val claimA = rentShapedTx(expiredA, H)
+    val claimB = rentShapedTx(expiredB, H)
+    val plainTx = plainSpend(plain, H)
+    val txs = Seq(claimA, plainTx, claimB)
+    val boxes = Seq(expiredA, expiredB, plain)
+
+    Seq(Header.InitialVersion, V4).foreach { v =>
+      withClue(s"block version $v: ") {
+        v < Header.StorageRentAttestationVersion shouldBe true
+        yoloSettings.chainSettings.storageRentAttestationRequired(v) shouldBe true
+        rentSettings.chainSettings.storageRentAttestationRequired(v) shouldBe false
+
+        val ctxYolo = stateContext(H, v, yoloSettings)
+        ctxYolo.blockVersion shouldBe v
+        ctxYolo.chainSettings.yolo.enabled shouldBe true
+
+        // claims: the field over them in block order is required
+        rejectedBy308(exec(txs, boxes, ctxYolo, noExtension)) shouldBe true
+        exec(txs, boxes, ctxYolo, attesting(claimA, claimB)).isValid shouldBe true
+        rejectedBy308(exec(txs, boxes, ctxYolo, attesting(claimB, claimA))) shouldBe true
+        rejectedBy308(exec(txs, boxes, ctxYolo, attesting(claimA))) shouldBe true
+        // no claim: the field must be absent
+        exec(Seq(plainTx), Seq(plain), ctxYolo, noExtension).isValid shouldBe true
+        rejectedBy308(exec(Seq(plainTx), Seq(plain), ctxYolo, attesting(plainTx))) shouldBe true
+        rejectedBy308(exec(Seq(plainTx), Seq(plain), ctxYolo, attesting())) shouldBe true
+
+        // switch off: the rule does not apply below block version 5
+        val ctxOff = stateContext(H, v, rentSettings)
+        exec(txs, boxes, ctxOff, noExtension).isValid shouldBe true
+        exec(Seq(plainTx), Seq(plain), ctxOff, attesting(plainTx)).isValid shouldBe true
+      }
+    }
+  }
+
+  property("yoloFromGenesis end to end: with the YOLO switch on, at block version 4, a full block with rent claims " +
+    "is applied to a UTXO state with the field and rejected by rule 308 without it, and a block without claims is " +
+    "rejected with a spurious field") {
+    val expiredA = boxAt(FalseTree, H - StoragePeriod, seed = 54)
+    val expiredB = boxAt(FalseTree, H - StoragePeriod - 100, seed = 55)
+    val plain = boxAt(TrueTree, H - 10, seed = 56)
+    val claimA = rentShapedTx(expiredA, H)
+    val claimB = rentShapedTx(expiredB, H)
+    val plainTx = plainSpend(plain, H)
+    val txs = Seq(claimA, plainTx, claimB)
+    val boxes = Seq(expiredA, expiredB, plain)
+
+    val applied = yoloApplyAtH(V4, boxes, txs, ExtensionCandidate(Seq(AttestationKey -> attestationDigest(claimA, claimB))))
+    applied shouldBe a[Success[_]]
+    applied.get.boxById(expiredA.id) shouldBe None
+    applied.get.boxById(claimB.outputs.head.id).isDefined shouldBe true
+
+    yoloApplyAtH(V4, boxes, txs, emptyExtension) match {
+      case Failure(e) => e.getMessage should include(RuleText)
+      case Success(_) => fail("block with unattested rent claims applied on YOLO at block version 4")
+    }
+    yoloApplyAtH(V4, Seq(plain), Seq(plainTx), ExtensionCandidate(Seq(AttestationKey -> attestationDigest(plainTx)))) match {
+      case Failure(e) => e.getMessage should include(RuleText)
+      case Success(_) => fail("block with a spurious attestation field applied on YOLO at block version 4")
+    }
+    yoloApplyAtH(V4, Seq(plain), Seq(plainTx), emptyExtension) shouldBe a[Success[_]]
   }
 
 }
