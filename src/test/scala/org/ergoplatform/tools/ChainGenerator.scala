@@ -50,7 +50,7 @@ object ChainGenerator extends App with ErgoTestHelpers with Matchers {
   val selfAddressScript = P2PKAddress(minerPk).script
   val minerProp = ErgoTreePredef.rewardOutputScript(RewardDelay, minerPk)
 
-  val pow = new AutolykosPowScheme(powScheme.k, powScheme.n)
+  val pow = new AutolykosPowScheme(powScheme.k, powScheme.n, powScheme.powHeightDivisor)
   val blockInterval = 2.minute
 
   val boxSelector: BoxSelector = new ReplaceCompactCollectBoxSelector(30, 2, None)

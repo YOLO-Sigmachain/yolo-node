@@ -38,11 +38,19 @@ import scala.util.Try
   * @see papers/yellow/pow/ErgoPow.tex for full description
   * @param k - number of elements in one solution
   * @param n - initially, N = 2^^n
+  * @param powHeightDivisor - d in `pow_height = height / d`: the table size N schedule, the table seed `h`
+  *                           (validation and CPU prover) and the `h` field of the external work message use
+  *                           `height / d` in place of the header height. The header message `msg` still commits
+  *                           to the real height. Default 1, which is upstream Ergo behaviour.
   */
-class AutolykosPowScheme(val k: Int, val n: Int) extends ScorexLogging {
+class AutolykosPowScheme(val k: Int, val n: Int, val powHeightDivisor: Int = 1) extends ScorexLogging {
 
   require(k <= 32, "k > 32 is not allowed due to genIndexes function")
   require(n < 31, "n >= 31 is not allowed")
+  require(powHeightDivisor >= 1, s"powHeightDivisor must be >= 1, got $powHeightDivisor")
+
+  /** Upstream two-argument constructor, kept for binary compatibility of ergo-core (divisor 1). */
+  def this(k: Int, n: Int) = this(k, n, 1)
 
   //Consensus-critical code below
 
@@ -91,7 +99,14 @@ class AutolykosPowScheme(val k: Int, val n: Int) extends ScorexLogging {
     }
   }
 
-  def calcN(header: HeaderWithoutPow): Int = calcN(header.version, header.height)
+  /**
+    * Height used by the PoW puzzle for a header at `headerHeight`: `headerHeight / powHeightDivisor`.
+    * Identity when the divisor is 1 (upstream behaviour).
+    */
+  def powHeight(headerHeight: Height): Height =
+    if (powHeightDivisor == 1) headerHeight else headerHeight / powHeightDivisor
+
+  def calcN(header: HeaderWithoutPow): Int = calcN(header.version, powHeight(header.height))
 
   /**
     * Constant data to be added to hash function to increase its calculation time
@@ -173,7 +188,7 @@ class AutolykosPowScheme(val k: Int, val n: Int) extends ScorexLogging {
     val msg = msgByHeader(header)
     val nonce = header.powSolution.n
 
-    val h = Ints.toByteArray(header.height)  // used in AL v.2 only
+    val h = Ints.toByteArray(powHeight(header.height))  // used in AL v.2 only
 
     val N = calcN(header)
 
@@ -303,7 +318,7 @@ class AutolykosPowScheme(val k: Int, val n: Int) extends ScorexLogging {
     val msg = msgByHeader(h)
     val b = getB(nBits)
     val x = randomSecret()
-    val hbs = Ints.toByteArray(h.height)
+    val hbs = Ints.toByteArray(powHeight(h.height))
     val N = calcN(h)
     checkNonces(version, hbs, msg, sk, x, b, N, minNonce, maxNonce).map(solution => h.toHeader(solution))
   }
@@ -430,7 +445,7 @@ class AutolykosPowScheme(val k: Int, val n: Int) extends ScorexLogging {
     val hOpt = if (blockCandidate.version == 1) {
       None
     } else {
-      Some(headerCandidate.height)
+      Some(powHeight(headerCandidate.height))
     }
 
     val proofs = if (mandatoryTxIds.nonEmpty) {

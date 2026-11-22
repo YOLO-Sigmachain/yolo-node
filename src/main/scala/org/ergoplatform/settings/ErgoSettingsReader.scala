@@ -211,19 +211,28 @@ object ErgoSettingsReader extends ScorexLogging
   }
 
   /**
-    * YOLO start-up check: the YOLO switch and the network must agree.
+    * YOLO start-up check: the YOLO switch, the PoW height divisor and the network must agree.
+    * The divisor (`ergo.chain.powScheme.powHeightDivisor`) is a separate setting from the switch
+    * (`ergo.chain.yolo.enabled`); a node with one set and not the other would reject or orphan every block.
     *
     * @return error message, or None if the settings are consistent
     */
   protected[settings] def yoloSettingsError(settings: ErgoSettings): Option[String] = {
     val chain = settings.chainSettings
     val yoloOn = chain.yolo.enabled
+    val divisor = chain.powScheme.powHeightDivisor
     if (yoloOn && settings.networkType != NetworkType.TestNet) {
       Some("ergo.chain.yolo.enabled = true requires networkType = `testnet`, " +
         s"but networkType is `${settings.networkType.verboseName}`")
     } else if (yoloOn && chain.isMainnet) {
       Some(s"ergo.chain.yolo.enabled = true with ergo.chain.addressPrefix = ${chain.addressPrefix}, " +
         "the Ergo mainnet address prefix; a YOLO node must not use it")
+    } else if (yoloOn && divisor == 1) {
+      Some("ergo.chain.yolo.enabled = true but ergo.chain.powScheme.powHeightDivisor = 1; " +
+        "YOLO uses powHeightDivisor = 4, without it the node rejects every YOLO block")
+    } else if (!yoloOn && divisor != 1) {
+      Some(s"ergo.chain.powScheme.powHeightDivisor = $divisor but ergo.chain.yolo.enabled is not true " +
+        "(check its spelling); an Ergo node needs powHeightDivisor = 1, a YOLO node needs yolo.enabled = true")
     } else {
       None
     }

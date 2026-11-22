@@ -35,7 +35,7 @@ object ChainGenerator extends ErgoTestHelpers with Matchers {
   import org.ergoplatform.utils.ErgoCoreTestConstants._
   import org.ergoplatform.utils.generators.ErgoCoreTransactionGenerators._
 
-  val pow: AutolykosPowScheme = new AutolykosPowScheme(powScheme.k, powScheme.n)
+  val pow: AutolykosPowScheme = new AutolykosPowScheme(powScheme.k, powScheme.n, powScheme.powHeightDivisor)
   val blockInterval: FiniteDuration = 1.minute
   val EmissionTxCost: Long = 20000
   val MinTxAmount: Long = 2000000

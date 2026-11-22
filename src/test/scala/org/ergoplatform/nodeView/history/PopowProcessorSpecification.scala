@@ -57,7 +57,10 @@ class PopowProcessorSpecification extends ErgoCorePropertyTest with FileUtils {
     applyChain(senderHistory, senderChain)
 
     val popowProofBytes = senderHistory.popowProofBytes().get
-    val realPowScheme = new AutolykosPowScheme(baseSettings.chainSettings.powScheme.k, baseSettings.chainSettings.powScheme.n)
+    val realPowScheme = new AutolykosPowScheme(
+      baseSettings.chainSettings.powScheme.k,
+      baseSettings.chainSettings.powScheme.n,
+      baseSettings.chainSettings.powScheme.powHeightDivisor)
     val receiverHistory = genRealPowHistory(senderHistory.bestHeaderAtHeight(1).map(_.id), realPowScheme)
     val popowProof = receiverHistory.nipopowSerializer.parseBytes(popowProofBytes)
 

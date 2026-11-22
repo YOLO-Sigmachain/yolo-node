@@ -62,7 +62,7 @@ object MinerBench extends App with ErgoTestHelpers {
   }
 
   def validationBench() {
-    val pow = new AutolykosPowScheme(powScheme.k, powScheme.n)
+    val pow = new AutolykosPowScheme(powScheme.k, powScheme.n, powScheme.powHeightDivisor)
     val sk = randomSecret()
     val difficulty = 1000
     val fb = invalidErgoFullBlockGen.sample.get

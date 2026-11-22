@@ -13,10 +13,12 @@ trait PowSchemeReaders {
       val schemeName = cfg.getString(schemeNameKey)
       val n = cfg.as[Int](s"$path.n")
       val k = cfg.as[Int](s"$path.k")
+      // pow_height = height / powHeightDivisor; absent means 1 (upstream Ergo)
+      val powHeightDivisor = cfg.as[Option[Int]](s"$path.powHeightDivisor").getOrElse(1)
       if (schemeName == "autolykos") {
-        new AutolykosPowScheme(k, n)
+        new AutolykosPowScheme(k, n, powHeightDivisor)
       } else if (schemeName == "fake") {
-        new DefaultFakePowScheme(k, n)
+        new DefaultFakePowScheme(k, n, powHeightDivisor)
       } else {
         throw new ConfigException.BadValue(schemeNameKey, schemeName)
       }

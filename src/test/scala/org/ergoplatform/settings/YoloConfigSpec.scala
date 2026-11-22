@@ -1,7 +1,7 @@
 package org.ergoplatform.settings
 
 import com.typesafe.config.ConfigFactory
-import org.ergoplatform.mining.DefaultFakePowScheme
+import org.ergoplatform.mining.{AutolykosPowScheme, DefaultFakePowScheme}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.utils.ErgoCorePropertyTest
 
@@ -37,6 +37,10 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.directory should not endWith "/.ergo"
     s.scorexSettings.network.knownPeers shouldBe Seq.empty
     s.scorexSettings.network.nodeName should startWith("yolo-")
+    s.chainSettings.powScheme.getClass shouldBe classOf[AutolykosPowScheme]
+    s.chainSettings.powScheme.powHeightDivisor shouldBe 4
+    s.chainSettings.powScheme.k shouldBe 32
+    s.chainSettings.powScheme.n shouldBe 26
     s.chainSettings.yolo.enabled shouldBe true
     s.chainSettings.yolo.softForkVotingStartHeight shouldBe 0
     s.chainSettings.dataInputsUniquenessHeight shouldBe 0
@@ -78,9 +82,10 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.scorexSettings.network.allowLocal shouldBe true
   }
 
-  property("the upstream test settings have the switch off") {
+  property("the upstream test settings have the switch off and divisor 1") {
     settings.chainSettings.yolo.enabled shouldBe false
     settings.chainSettings.powScheme shouldBe a[DefaultFakePowScheme]
+    settings.chainSettings.powScheme.powHeightDivisor shouldBe 1
     // rule 308 as upstream: from block version 5 only
     settings.chainSettings.storageRentAttestationRequired(Header.Interpreter60Version) shouldBe false
     settings.chainSettings.storageRentAttestationRequired(Header.StorageRentAttestationVersion) shouldBe true
@@ -112,6 +117,26 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     val err = ErgoSettingsReader.yoloSettingsError(mainnetPrefix)
     err shouldBe defined
     err.get should include("addressPrefix")
+  }
+
+  property("start-up check refuses a YOLO switch and PoW divisor that disagree") {
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+
+    // switch on, divisor 1 (a YOLO conf missing powHeightDivisor = 4)
+    val noDivisor = yolo.copy(chainSettings = yolo.chainSettings.copy(powScheme = new AutolykosPowScheme(32, 26, 1)))
+    val err1 = ErgoSettingsReader.yoloSettingsError(noDivisor)
+    err1 shouldBe defined
+    err1.get should include("powHeightDivisor = 1")
+
+    // switch off, divisor 4 (e.g. `enabled` misspelt)
+    val noSwitch = yolo.copy(chainSettings = yolo.chainSettings.copy(yolo = YoloSettings.disabled))
+    val err2 = ErgoSettingsReader.yoloSettingsError(noSwitch)
+    err2 shouldBe defined
+    err2.get should include("powHeightDivisor = 4")
+
+    // upstream settings with divisor 4 and the switch off
+    ErgoSettingsReader.yoloSettingsError(
+      settings.copy(chainSettings = settings.chainSettings.copy(powScheme = new DefaultFakePowScheme(32, 26, 4)))) shouldBe defined
   }
 
   property("unknown keys in the yolo block are refused, e.g. the `enable` typo") {

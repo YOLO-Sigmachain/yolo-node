@@ -24,7 +24,10 @@ class PrunedNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps
     val defaultSettings = ErgoSettingsReader.read()
     defaultSettings.copy(
       chainSettings = defaultSettings.chainSettings.copy(
-        powScheme = new DefaultFakePowScheme(defaultSettings.chainSettings.powScheme.k, defaultSettings.chainSettings.powScheme.n),
+        powScheme = new DefaultFakePowScheme(
+          defaultSettings.chainSettings.powScheme.k,
+          defaultSettings.chainSettings.powScheme.n,
+          defaultSettings.chainSettings.powScheme.powHeightDivisor),
         voting = VotingSettings(10, 10, 10, 10000, "01"),
         blockInterval = BlockInterval
       ),

@@ -18,6 +18,7 @@ class YoloSettingsSpec extends ErgoCorePropertyTest {
   property("the switch is off in the upstream test settings") {
     chainSettings.yolo shouldBe YoloSettings.disabled
     chainSettings.yolo.enabled shouldBe false
+    chainSettings.powScheme.powHeightDivisor shouldBe 1
   }
 
   property("with the switch off, rule 110 and 125 activation heights are the upstream constants") {
