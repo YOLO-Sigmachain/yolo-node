@@ -54,8 +54,8 @@ trait HeadersProcessor extends ToDownloadProcessor with PopowProcessor with Scor
 
   val powScheme: AutolykosPowScheme
 
-  // Maximum time in future block header may have
-  protected lazy val MaxTimeDrift: Long = 10 * chainSettings.blockInterval.toMillis
+  // Maximum time in future block header may have: 10 block intervals, 4 with the YOLO switch on
+  protected lazy val MaxTimeDrift: Long = chainSettings.maxTimeDrift
 
   lazy val difficultyCalculator = new DifficultyAdjustment(chainSettings)
 
@@ -337,7 +337,24 @@ trait HeadersProcessor extends ToDownloadProcessor with PopowProcessor with Scor
 
     val eip37ActivationHeight = 844673
 
-    if (settings.networkType.isMainNet && parentHeight + 1 >= eip37ActivationHeight) {
+    if (chainSettings.yolo.enabled) {
+      // YOLO (SigmaChain): EIP-37 from genesis. No retarget until parent height 2 * epochLength, and the result
+      // is floored at YoloSettings.MinDifficulty (see DifficultyAdjustment.yoloIsRetarget, yoloEip37Calculate).
+      // eip37EpochLength is required to be set on YOLO by the start-up check in ErgoSettingsReader.
+      val epochLength = chainSettings.eip37EpochLength.getOrElse(chainSettings.epochLength)
+      if (difficultyCalculator.yoloIsRetarget(parentHeight, epochLength)) {
+        val heights = difficultyCalculator.previousHeightsRequiredForRecalculation(parentHeight + 1, epochLength)
+        val headers = if (historyReader.isInBestChain(parent)) {
+          heights.flatMap(height => historyReader.bestHeaderAtHeight(height))
+        } else {
+          val chain = headerChainBack(heights.max - heights.min + 1, parent, _ => false)
+          chain.headers.filter(p => heights.contains(p.height))
+        }
+        difficultyCalculator.yoloEip37Calculate(headers, epochLength)
+      } else {
+        parent.requiredDifficulty
+      }
+    } else if (settings.networkType.isMainNet && parentHeight + 1 >= eip37ActivationHeight) {
       val epochLength = 128 // epoch length after EIP-37 activation
       if (parentHeight % epochLength == 0) {
         val heights = difficultyCalculator.previousHeightsRequiredForRecalculation(parentHeight + 1, epochLength)
@@ -386,6 +403,14 @@ trait HeadersProcessor extends ToDownloadProcessor with PopowProcessor with Scor
 
     private def time(): Time = System.currentTimeMillis()
 
+    /**
+      * Detail of a refused future timestamp (rule 211). The rule's message keeps the upstream text, which says
+      * 20 minutes; with the YOLO switch on the detail also gives this chain's limit. With the switch off the detail
+      * is as upstream.
+      */
+    private def futureTimestampDetail(header: Header): String =
+      s"${header.timestamp} vs ${time()}" + (if (chainSettings.yolo.enabled) s", limit $MaxTimeDrift ms" else "")
+
     def validate(header: Header): ValidationResult[Unit] = {
       if (header.isGenesis) {
         validateGenesisBlockHeader(header)
@@ -408,7 +433,7 @@ trait HeadersProcessor extends ToDownloadProcessor with PopowProcessor with Scor
         .validateEquals(hdrRequiredDifficulty, header.requiredDifficulty, chainSettings.initialDifficulty, header.id, header.modifierTypeId)
         .validateNot(alreadyApplied, historyStorage.contains(header.id), InvalidModifier(header.toString, header.id, header.modifierTypeId))
         .validate(hdrTooOld, fullBlockHeight < nodeSettings.keepVersions, InvalidModifier(heightOf(header.parentId).toString, header.id, header.modifierTypeId))
-        .validate(hdrFutureTimestamp, header.timestamp - time() <= MaxTimeDrift, InvalidModifier(s"${header.timestamp} vs ${time()}", header.id, header.modifierTypeId))
+        .validate(hdrFutureTimestamp, header.timestamp - time() <= MaxTimeDrift, InvalidModifier(futureTimestampDetail(header), header.id, header.modifierTypeId))
         .result
     }
 
@@ -423,7 +448,7 @@ trait HeadersProcessor extends ToDownloadProcessor with PopowProcessor with Scor
         .validateEquals(hdrRequiredDifficulty, header.requiredDifficulty, requiredDifficultyAfter(parent), header.id, header.modifierTypeId)
         .validate(hdrTooOld, heightOf(header.parentId).exists(h => fullBlockHeight - h < nodeSettings.keepVersions), InvalidModifier(heightOf(header.parentId).toString, header.id, header.modifierTypeId))
         .validateSemantics(hdrParentSemantics, isSemanticallyValid(header.parentId), InvalidModifier(s"Parent semantics broken", header.id, header.modifierTypeId))
-        .validate(hdrFutureTimestamp, header.timestamp - time() <= MaxTimeDrift, InvalidModifier(s"${header.timestamp} vs ${time()}", header.id, header.modifierTypeId))
+        .validate(hdrFutureTimestamp, header.timestamp - time() <= MaxTimeDrift, InvalidModifier(futureTimestampDetail(header), header.id, header.modifierTypeId))
         .validateNot(alreadyApplied, historyStorage.contains(header.id), InvalidModifier(s"${header.id} already applied", header.id, header.modifierTypeId))
         .validate(hdrCheckpoint, checkpointCondition(header), InvalidModifier(s"${header.id} wrong checkpoint", header.id, header.modifierTypeId))
         .result

@@ -53,4 +53,29 @@ object YoloSettings {
     */
   val MaxBlockCost: Int = 1500000
 
+  /**
+    * Difficulty floor on YOLO: an EIP-37 retarget never returns less (`DifficultyAdjustment.yoloEip37Calculate`),
+    * and the start-up check refuses an initial difficulty below it. At difficulty 1 EIP-37 cannot climb
+    * (1 * 3 / 2 = 1) and after a slow epoch falls to 0, which makes the PoW target q / 0 and halts the chain.
+    * Deliberately tiny: it only removes those dead states. A constant, not a config value, so that no node can
+    * restart with a different floor and fork itself off. Exactly representable in nBits.
+    */
+  val MinDifficulty: BigInt = BigInt(2)
+
+  /**
+    * EIP-37 epoch length on YOLO: 64 blocks, 32 minutes at 30 s blocks (Ergo mainnet: 128). With the first-retarget
+    * guard the first retarget is at block 129. `ergo.chain.eip37EpochLength` must equal it when the switch
+    * is on (`ErgoSettingsReader.yoloSettingsError`): the retarget heights follow from it, so a node with another
+    * value would retarget at heights no other node does and fork itself off. A constant for the same reason as
+    * `MinDifficulty`. Not the voting epoch, which is `ergo.chain.voting.votingLength` and is not tied to this value.
+    */
+  val Eip37EpochLength: Int = 64
+
+  /**
+    * Future-timestamp limit for headers on YOLO, in block intervals: 4, so 2 minutes at 30 s blocks (Ergo: 10).
+    * Used by `ChainSettings.maxTimeDrift`. A smaller limit narrows how far one miner can move the next difficulty
+    * with a false timestamp on the last block of an epoch. A constant, as every node must apply the same limit.
+    */
+  val MaxTimeDriftBlocks: Int = 4
+
 }

@@ -29,7 +29,7 @@ object Constants {
   val BlocksPerYear: Int = BlocksPerDay * 365
 
   //For how many blocks a box could be put into the state with no paying.
-  //4 years
+  //4 years at Ergo's 2 minute blocks (the block counts above assume them); one year at YOLO's 30 s blocks
   val StoragePeriod: Int = 4 * BlocksPerYear // 1,051,200 blocks
 
   val StorageContractCost: Long = 50

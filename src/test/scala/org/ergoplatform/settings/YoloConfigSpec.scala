@@ -8,6 +8,7 @@ import org.ergoplatform.utils.ErgoCorePropertyTest
 import java.io.File
 import java.net.InetSocketAddress
 import scala.collection.JavaConverters._
+import scala.concurrent.duration._
 
 /**
   * The YOLO conf files (network magic, addresses, node name and peers, block interval, headerChainDiff,
@@ -37,6 +38,8 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.directory should not endWith "/.ergo"
     s.scorexSettings.network.knownPeers shouldBe Seq.empty
     s.scorexSettings.network.nodeName should startWith("yolo-")
+    s.chainSettings.blockInterval shouldBe 30.seconds
+    s.nodeSettings.headerChainDiff shouldBe 400
     s.chainSettings.powScheme.getClass shouldBe classOf[AutolykosPowScheme]
     s.chainSettings.powScheme.powHeightDivisor shouldBe 4
     s.chainSettings.powScheme.k shouldBe 32
@@ -51,10 +54,17 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.chainSettings.genesisBlockVersion(s.launchParameters.blockVersion) shouldBe Header.Interpreter60Version
     s.launchParameters.storageFeeFactor shouldBe 300000
     s.launchParameters.maxBlockCost shouldBe 1500000
+    // EIP-37 epoch 64, and the plain difficulty epoch set to match; genesis difficulty placeholder at the floor
+    // (never "01")
+    s.chainSettings.eip37EpochLength shouldBe Some(64)
+    s.chainSettings.epochLength shouldBe 64
+    s.chainSettings.initialDifficultyHex shouldBe "02"
+    s.chainSettings.initialDifficulty shouldBe YoloSettings.MinDifficulty
 
     // values kept from the in-tree testnet.conf
     s.chainSettings.addressPrefix shouldBe 16
     s.chainSettings.protocolVersion shouldBe 4
+    // the voting epoch is a separate setting and stays at 128
     s.chainSettings.voting.votingLength shouldBe 128
     s.chainSettings.voting.softForkEpochs shouldBe 32
     s.chainSettings.voting.activationEpochs shouldBe 32
@@ -137,6 +147,85 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     // upstream settings with divisor 4 and the switch off
     ErgoSettingsReader.yoloSettingsError(
       settings.copy(chainSettings = settings.chainSettings.copy(powScheme = new DefaultFakePowScheme(32, 26, 4)))) shouldBe defined
+  }
+
+  property("start-up check refuses YOLO with the EIP-37 epoch length unset or other than 64") {
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    YoloSettings.Eip37EpochLength shouldBe 64
+    Seq(None, Some(0), Some(1), Some(-64), Some(2), Some(63), Some(65), Some(1024), Some(Int.MaxValue)).foreach { l =>
+      val err = ErgoSettingsReader.yoloSettingsError(yolo.copy(chainSettings = yolo.chainSettings.copy(eip37EpochLength = l)))
+      withClue(s"eip37EpochLength = $l: ") {
+        err shouldBe defined
+        err.get should include("eip37EpochLength")
+      }
+    }
+    ErgoSettingsReader.yoloSettingsError(yolo.copy(chainSettings = yolo.chainSettings.copy(eip37EpochLength = Some(64)))) shouldBe None
+  }
+
+  property("start-up check refuses a YOLO EIP-37 epoch length of 32 or 128, which would retarget at other heights") {
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    Seq(32, 128).foreach { l =>
+      val err = ErgoSettingsReader.yoloSettingsError(yolo.copy(chainSettings = yolo.chainSettings.copy(eip37EpochLength = Some(l))))
+      withClue(s"eip37EpochLength = $l: ") {
+        err shouldBe defined
+        err.get should include(s"eip37EpochLength = $l")
+        err.get should include("epoch length 64")
+      }
+    }
+  }
+
+  property("start-up check refuses YOLO with useLastEpochs below 2, with a message and no division by zero") {
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    yolo.chainSettings.useLastEpochs shouldBe 8
+    Seq(1, 0, -1, Int.MinValue).foreach { n =>
+      val err = ErgoSettingsReader.yoloSettingsError(yolo.copy(chainSettings = yolo.chainSettings.copy(useLastEpochs = n)))
+      withClue(s"useLastEpochs = $n: ") {
+        err shouldBe defined
+        err.get should include(s"useLastEpochs = $n")
+      }
+    }
+    ErgoSettingsReader.yoloSettingsError(yolo.copy(chainSettings = yolo.chainSettings.copy(useLastEpochs = 2))) shouldBe None
+  }
+
+  property("start-up check refuses a YOLO initial difficulty below the floor of 2, e.g. testnet.conf's 01") {
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    def withDiff(hex: String): ErgoSettings = yolo.copy(chainSettings = yolo.chainSettings.copy(initialDifficultyHex = hex))
+
+    // "80" and "ff" parse as negative numbers (two's complement)
+    Seq("01", "00", "0001", "80", "ff", "ff02").foreach { hex =>
+      val err = ErgoSettingsReader.yoloSettingsError(withDiff(hex))
+      withClue(s"initialDifficultyHex = $hex: ") {
+        err shouldBe defined
+        err.get should include("initialDifficultyHex")
+        err.get should include("floor")
+      }
+    }
+    // at or above the floor, exactly representable in nBits: accepted (011765000000 is the Ergo mainnet value)
+    Seq("02", "0002", "03", "7f", "0080", "0100", "011765000000").foreach { hex =>
+      withClue(s"initialDifficultyHex = $hex: ") {
+        ErgoSettingsReader.yoloSettingsError(withDiff(hex)) shouldBe None
+      }
+    }
+    // with the switch off the upstream values are not checked: the upstream test settings use "01"
+    settings.chainSettings.initialDifficultyHex shouldBe "01"
+    ErgoSettingsReader.yoloSettingsError(settings) shouldBe None
+    ErgoSettingsReader.yoloSettingsError(
+      withDiff("01").copy(chainSettings = withDiff("01").chainSettings.copy(yolo = YoloSettings.disabled,
+        powScheme = new AutolykosPowScheme(32, 26, 1)))) shouldBe None
+  }
+
+  property("start-up check refuses a YOLO initial difficulty that nBits cannot represent exactly") {
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    def withDiff(hex: String): ErgoSettings = yolo.copy(chainSettings = yolo.chainSettings.copy(initialDifficultyHex = hex))
+    // 4 significant bytes: nBits keeps 3, so the genesis header could never carry this difficulty
+    Seq("01234567", "011765000001", "7fffffff").foreach { hex =>
+      val err = ErgoSettingsReader.yoloSettingsError(withDiff(hex))
+      withClue(s"initialDifficultyHex = $hex: ") {
+        err shouldBe defined
+        err.get should include("representable")
+      }
+    }
+    ErgoSettingsReader.yoloSettingsError(withDiff("01234500")) shouldBe None
   }
 
   property("unknown keys in the yolo block are refused, e.g. the `enable` typo") {

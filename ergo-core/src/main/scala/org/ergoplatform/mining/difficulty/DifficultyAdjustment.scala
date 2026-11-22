@@ -2,7 +2,7 @@ package org.ergoplatform.mining.difficulty
 
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils.{Difficulty, Height}
-import org.ergoplatform.settings.ChainSettings
+import org.ergoplatform.settings.{ChainSettings, YoloSettings}
 import scorex.util.ScorexLogging
 import scala.concurrent.duration.FiniteDuration
 
@@ -100,6 +100,35 @@ class DifficultyAdjustment(val chainSettings: ChainSettings) extends ScorexLoggi
     DifficultySerializer.decodeCompactBits(
       DifficultySerializer.encodeCompactBits(uncompressedDiff)
     )
+  }
+
+  /**
+    * YOLO (SigmaChain) only, used when `chainSettings.yolo.enabled`: EIP-37 runs from genesis, so the first
+    * retarget is moved to the block after parent height `2 * epochLength`. At parent height `epochLength`,
+    * `previousHeightsRequiredForRecalculation` asks for heights 0 and `epochLength`, and height 0 does not exist
+    * (genesis height is 1), so `eip37Calculate` would get one header and fail its `size >= 2` requirement.
+    * Blocks 1 to `2 * epochLength` therefore keep the genesis difficulty; block `2 * epochLength + 1` is the first
+    * retarget, from the headers at heights `epochLength` and `2 * epochLength`.
+    *
+    * @param parentHeight - height of the parent of the block whose difficulty is wanted
+    * @param epochLength  - EIP-37 epoch length
+    * @return true if the block after `parentHeight` is a YOLO retarget block
+    */
+  def yoloIsRetarget(parentHeight: Height, epochLength: Int): Boolean = {
+    parentHeight % epochLength == 0 && parentHeight / epochLength >= 2
+  }
+
+  /**
+    * YOLO (SigmaChain) only, used when `chainSettings.yolo.enabled`: `eip37Calculate` with its (already
+    * normalised) result raised to `YoloSettings.MinDifficulty`. At difficulty 1 EIP-37 cannot climb
+    * (1 * 3 / 2 = 1) and after a slow epoch falls to 0, which makes the PoW target q / 0.
+    * The floor is exactly representable in nBits, so the result stays normalised.
+    *
+    * @param previousHeaders - last headers of few epochs, as for `eip37Calculate`
+    * @param epochLength     - EIP-37 epoch length
+    */
+  def yoloEip37Calculate(previousHeaders: Seq[Header], epochLength: Int): Difficulty = {
+    eip37Calculate(previousHeaders, epochLength).max(YoloSettings.MinDifficulty)
   }
 
   @SuppressWarnings(Array("TraversableHead"))

@@ -9,6 +9,7 @@ import net.ceedubs.ficus.Ficus._
 import net.ceedubs.ficus.readers.ArbitraryTypeReader._
 import org.ergoplatform.nodeView.state.StateType.Digest
 import org.ergoplatform.ErgoApp
+import org.ergoplatform.mining.difficulty.DifficultySerializer
 import scorex.util.ScorexLogging
 import org.ergoplatform.settings.ErgoSettings.{configPath, scorexConfigPath}
 
@@ -214,6 +215,8 @@ object ErgoSettingsReader extends ScorexLogging
     * YOLO start-up check: the YOLO switch, the PoW height divisor and the network must agree.
     * The divisor (`ergo.chain.powScheme.powHeightDivisor`) is a separate setting from the switch
     * (`ergo.chain.yolo.enabled`); a node with one set and not the other would reject or orphan every block.
+    * With the switch on, the difficulty settings must also suit EIP-37 from genesis: `useLastEpochs` at
+    * least 2, `eip37EpochLength` equal to `YoloSettings.Eip37EpochLength`, and an initial difficulty at or above `YoloSettings.MinDifficulty` that nBits represents exactly.
     *
     * @return error message, or None if the settings are consistent
     */
@@ -233,6 +236,23 @@ object ErgoSettingsReader extends ScorexLogging
     } else if (!yoloOn && divisor != 1) {
       Some(s"ergo.chain.powScheme.powHeightDivisor = $divisor but ergo.chain.yolo.enabled is not true " +
         "(check its spelling); an Ergo node needs powHeightDivisor = 1, a YOLO node needs yolo.enabled = true")
+    } else if (yoloOn && chain.useLastEpochs < 2) {
+      // DifficultyAdjustment requires useLastEpochs > 1 and would otherwise fail when the history is opened
+      Some(s"ergo.chain.yolo.enabled = true but ergo.chain.useLastEpochs = ${chain.useLastEpochs}; " +
+        "the EIP-37 difficulty calculation needs at least 2 epochs (YOLO: 8)")
+    } else if (yoloOn && !chain.eip37EpochLength.contains(YoloSettings.Eip37EpochLength)) {
+      Some(s"ergo.chain.yolo.enabled = true but ergo.chain.eip37EpochLength = ${chain.eip37EpochLength.getOrElse("unset")}; " +
+        s"YOLO runs EIP-37 from genesis with epoch length ${YoloSettings.Eip37EpochLength}, and a node with any other " +
+        "value retargets at different heights and forks itself off")
+    } else if (yoloOn && chain.initialDifficulty < YoloSettings.MinDifficulty) {
+      Some(s"ergo.chain.yolo.enabled = true but ergo.chain.initialDifficultyHex = `${chain.initialDifficultyHex}` " +
+        s"(${chain.initialDifficulty}) is below the YOLO difficulty floor ${YoloSettings.MinDifficulty}; " +
+        "at difficulty 1 EIP-37 cannot climb and can fall to 0")
+    } else if (yoloOn &&
+      DifficultySerializer.decodeCompactBits(chain.initialNBits) != chain.initialDifficulty) {
+      Some(s"ergo.chain.yolo.enabled = true but ergo.chain.initialDifficultyHex = `${chain.initialDifficultyHex}` " +
+        s"(${chain.initialDifficulty}) is not exactly representable in nBits " +
+        s"(it encodes as ${DifficultySerializer.decodeCompactBits(chain.initialNBits)}), so no genesis header could match it")
     } else {
       None
     }

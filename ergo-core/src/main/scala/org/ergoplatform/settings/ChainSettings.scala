@@ -93,4 +93,13 @@ case class ChainSettings(protocolVersion: Byte,
   def genesisBlockVersion(launchBlockVersion: Byte): Byte =
     if (yolo.enabled) launchBlockVersion else Header.InitialVersion
 
+  /**
+    * How far ahead of the node's clock a header timestamp may be, in milliseconds (validation rule 211,
+    * `hdrFutureTimestamp`, checked in `HeadersProcessor`). Upstream: 10 block intervals. With the YOLO switch on:
+    * `YoloSettings.MaxTimeDriftBlocks` (4) block intervals, 2 minutes at 30 s blocks. A header beyond the limit is
+    * refused as a recoverable error, so it can be accepted later, once the node's clock has caught up.
+    */
+  def maxTimeDrift: Long =
+    (if (yolo.enabled) YoloSettings.MaxTimeDriftBlocks else 10) * blockInterval.toMillis
+
 }
