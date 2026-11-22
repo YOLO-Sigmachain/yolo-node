@@ -21,7 +21,7 @@ import org.ergoplatform.nodeView.ErgoNodeViewHolder.CurrentView
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateReader}
-import org.ergoplatform.settings.{ErgoSettings, NetworkType}
+import org.ergoplatform.settings.{Args, ErgoSettings, ErgoSettingsReader, NetworkType}
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.createDigestState
 import scorex.util.{ModifierId, bytesToId}
@@ -1164,6 +1164,51 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     }
     indexSnapshot() shouldBe before
     indexer ! Reset()
+  }
+
+  property("genesis boxes holding tokens get token rows, which a rollback to height 1 keeps") {
+    val devnetPath = new java.io.File(getClass.getClassLoader.getResource("yolo-devnet.conf").toURI).getAbsolutePath
+    val devnet = ErgoSettingsReader.read(Args(Some(devnetPath), Some(NetworkType.TestNet)))
+    // the YOLO emission, treasury fund and LP fund boxes, one NFT each, after the genesis boxes of the test chain
+    val nftBoxes = ErgoState.genesisBoxes(devnet.chainSettings).take(3)
+    nftBoxes.foreach(_.additionalTokens.length shouldBe 1)
+    val tokenIndexer = system.actorOf(Props(new ExtraIndexerTestActor(this, true, nftBoxes)))
+    try {
+      tokenIndexer ! CreateDB(10)
+      tokenIndexer ! Index()
+      awaitCondition(done)
+
+      def checkTokenRows(): Unit = nftBoxes.zipWithIndex.foreach { case (box, i) =>
+        val number = genesisBoxes.size + i
+        val boxId = bytesToId(box.id)
+        NumericBoxIndex.getBoxByNumber(history, number).map(_.id) shouldBe Some(boxId)
+        val (tokenId, amount) = box.additionalTokens(0)
+        val row = history.typedExtraIndexById[IndexedToken](IndexedTokenSerializer.uniqueId(bytesToId(tokenId.toArray))).get
+        (row.tokenId, row.boxId, row.amount, row.name, row.description, row.decimals) shouldBe
+          ((bytesToId(tokenId.toArray), Some(boxId), Some(amount), Some(""), Some(""), Some(0)))
+        row.boxCount shouldBe 1
+        row.retrieveBoxes(history, 0, 100).map(_.id).toSeq shouldBe Seq(boxId)
+        history.typedExtraIndexById[IndexedErgoAddress](hashErgoTree(box.ergoTree)).flatMap(_.balanceInfo)
+          .map(bi => bi.nanoErgs -> bi.tokens.toSeq) shouldBe Some(box.value -> Seq(bytesToId(tokenId.toArray) -> amount))
+      }
+      checkTokenRows()
+      val before = indexSnapshot()
+
+      tokenIndexer ! ForceRollback(1)
+      awaitCondition(done)
+      IndexerState.fromHistory(_history).indexedHeight shouldBe 1
+      checkTokenRows()
+
+      tokenIndexer ! Index()
+      org.ergoplatform.utils.untilTimeout(60.seconds, 100.millis) {
+        IndexerState.fromHistory(_history).indexedHeight shouldBe 10
+      }
+      checkTokenRows()
+      indexSnapshot() shouldBe before
+    } finally {
+      tokenIndexer ! Reset()
+      system.stop(tokenIndexer)
+    }
   }
 
   property("storage rent eligibility index") {

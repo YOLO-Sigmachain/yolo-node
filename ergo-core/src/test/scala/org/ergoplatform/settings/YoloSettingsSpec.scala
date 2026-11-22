@@ -83,4 +83,74 @@ class YoloSettingsSpec extends ErgoCorePropertyTest {
     cfg.as[YoloSettings]("y") shouldBe YoloSettings.disabled
   }
 
+  property("the yolo section and its emission inputs are read from config") {
+    val cfg = ConfigFactory.parseString(
+      """y {
+        |  enabled = true
+        |  softForkVotingStartHeight = 1024
+        |  emission {
+        |    emissionTreeHex = "aa"
+        |    treasuryAccumulationTreeHex = "bb"
+        |    lpAccumulationTreeHex = "cc"
+        |    treasuryFundTreeHex = "dd"
+        |    lpFundTreeHex = "ee"
+        |    emissionNftId = "01"
+        |    treasuryNftId = "02"
+        |    lpNftId = "03"
+        |    genesisValue = 177291450000000000
+        |    treasuryFundValue = 100000000000
+        |    lpFundValue = 100000000001
+        |    lpWhitelist = [
+        |      { hash = "0a", height = 0 },
+        |      { hash = "0b", height = 7 }
+        |    ]
+        |  }
+        |}""".stripMargin)
+    cfg.as[YoloSettings]("y") shouldBe YoloSettings(
+      enabled = true,
+      softForkVotingStartHeight = 1024,
+      emission = YoloEmissionSettings("aa", "bb", "cc", "dd", "ee", "01", "02", "03",
+        177291450000000000L, 100000000000L, 100000000001L,
+        Seq(YoloWhitelistEntry("0a", 0L), YoloWhitelistEntry("0b", 7L))))
+
+    // partial emission section: missing fields take their defaults
+    ConfigFactory.parseString("y { enabled = true, emission { lpAccumulationTreeHex = \"cc\" } }")
+      .as[YoloSettings]("y") shouldBe
+      YoloSettings(enabled = true, emission = YoloEmissionSettings(lpAccumulationTreeHex = "cc"))
+
+    // an empty whitelist reads as an empty Seq
+    ConfigFactory.parseString("y { emission { lpWhitelist = [] } }")
+      .as[YoloSettings]("y").emission.lpWhitelist shouldBe Seq.empty
+
+    // the public test signer keys are refused unless allowed; the setting defaults to false
+    ConfigFactory.parseString("y { emission { allowTestSignerKeys = true } }")
+      .as[YoloSettings]("y").emission.allowTestSignerKeys shouldBe true
+    ConfigFactory.parseString("y { emission { } }")
+      .as[YoloSettings]("y").emission.allowTestSignerKeys shouldBe false
+  }
+
+  property("the YOLO emission rules are reachable only with the switch on") {
+    chainSettings.yoloEmissionRulesOpt shouldBe None
+    val on = chainSettings.copy(yolo = YoloSettings(enabled = true,
+      emission = YoloEmissionSettings(genesisValue = 177291450000000000L)))
+    on.yoloEmissionRulesOpt.map(_.genesisValue) shouldBe Some(177291450000000000L)
+    on.yoloEmissionRulesOpt.map(_.terminalHeight) shouldBe Some(21024049L)
+    // the Ergo rules stay as they are
+    on.emissionRules.minersCoinsTotal shouldBe chainSettings.emissionRules.minersCoinsTotal
+  }
+
+  property("YOLO tree and id decoding is strict") {
+    YoloEmissionSettings.decodeId("ab" * 32).isSuccess shouldBe true
+    Seq("", "ab" * 31, "ab" * 33, "zz" * 32, "abc").foreach { hex =>
+      withClue(s"id `$hex`: ") { YoloEmissionSettings.decodeId(hex).isFailure shouldBe true }
+    }
+    val trueTreeHex = scorex.util.encode.Base16.encode(Constants.TrueTree.bytes)
+    YoloEmissionSettings.parseTree(trueTreeHex).map(_.bytes.toSeq) shouldBe
+      scala.util.Success(Constants.TrueTree.bytes.toSeq)
+    // empty, not hex, truncated, trailing byte
+    Seq("", "zz", trueTreeHex.take(2), trueTreeHex.dropRight(2), trueTreeHex + "00").foreach { hex =>
+      withClue(s"tree `$hex`: ") { YoloEmissionSettings.parseTree(hex).isFailure shouldBe true }
+    }
+  }
+
 }

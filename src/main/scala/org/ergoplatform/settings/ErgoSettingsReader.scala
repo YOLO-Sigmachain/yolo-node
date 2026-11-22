@@ -8,6 +8,7 @@ import com.typesafe.config.{Config, ConfigFactory, ConfigValueFactory}
 import net.ceedubs.ficus.Ficus._
 import net.ceedubs.ficus.readers.ArbitraryTypeReader._
 import org.ergoplatform.nodeView.state.StateType.Digest
+import org.ergoplatform.nodeView.state.YoloGenesis
 import org.ergoplatform.ErgoApp
 import org.ergoplatform.mining.difficulty.DifficultySerializer
 import scorex.util.ScorexLogging
@@ -187,10 +188,19 @@ object ErgoSettingsReader extends ScorexLogging
     }.getOrElse(false)
 
   /** Keys allowed in `ergo.chain.yolo` (the fields of `YoloSettings`). */
-  private val YoloConfigKeys: Set[String] = Set("enabled", "softForkVotingStartHeight")
+  private val YoloConfigKeys: Set[String] = Set("enabled", "softForkVotingStartHeight", "emission")
+
+  /** Keys allowed in `ergo.chain.yolo.emission` (the fields of `YoloEmissionSettings`). */
+  private val YoloEmissionConfigKeys: Set[String] = Set(
+    "emissionTreeHex", "treasuryAccumulationTreeHex", "lpAccumulationTreeHex", "treasuryFundTreeHex", "lpFundTreeHex",
+    "emissionNftId", "treasuryNftId", "lpNftId", "genesisValue", "treasuryFundValue", "lpFundValue", "lpWhitelist",
+    "allowTestSignerKeys")
+
+  /** Keys allowed in each entry of `ergo.chain.yolo.emission.lpWhitelist` (the fields of `YoloWhitelistEntry`). */
+  private val YoloWhitelistEntryKeys: Set[String] = Set("hash", "height")
 
   /**
-    * Unknown keys in the `ergo.chain.yolo` block.
+    * Unknown keys in the `ergo.chain.yolo` block and its `emission` block.
     *
     * @return error message naming the unknown keys, or None if there are none (or the block is absent)
     */
@@ -202,11 +212,27 @@ object ErgoSettingsReader extends ScorexLogging
       val yoloCfg = config.getConfig(yoloPath)
       def unknown(cfg: Config, allowed: Set[String], prefix: String): Seq[String] =
         cfg.root().keySet().asScala.toSeq.sorted.filterNot(allowed.contains).map(k => s"$prefix.$k")
-      val all = unknown(yoloCfg, YoloConfigKeys, yoloPath)
+      val emissionUnknown = if (yoloCfg.hasPath("emission")) {
+        val emissionCfg = yoloCfg.getConfig("emission")
+        // entries of the LP whitelist are objects too; a non-object entry is left to the reader to refuse
+        val whitelistUnknown = if (emissionCfg.hasPath("lpWhitelist")) {
+          Try(emissionCfg.getConfigList("lpWhitelist").asScala.toSeq).getOrElse(Seq.empty).zipWithIndex.flatMap {
+            case (entry, i) => unknown(entry, YoloWhitelistEntryKeys, s"$yoloPath.emission.lpWhitelist.$i")
+          }
+        } else {
+          Seq.empty
+        }
+        unknown(emissionCfg, YoloEmissionConfigKeys, s"$yoloPath.emission") ++ whitelistUnknown
+      } else {
+        Seq.empty
+      }
+      val all = unknown(yoloCfg, YoloConfigKeys, yoloPath) ++ emissionUnknown
       if (all.isEmpty) {
         None
       } else {
-        Some(s"unknown key(s) ${all.mkString(", ")}; allowed in $yoloPath: ${YoloConfigKeys.toSeq.sorted.mkString(", ")}")
+        Some(s"unknown key(s) ${all.mkString(", ")}; allowed in $yoloPath: ${YoloConfigKeys.toSeq.sorted.mkString(", ")}; " +
+          s"allowed in $yoloPath.emission: ${YoloEmissionConfigKeys.toSeq.sorted.mkString(", ")}; " +
+          s"allowed in each $yoloPath.emission.lpWhitelist entry: ${YoloWhitelistEntryKeys.toSeq.sorted.mkString(", ")}")
       }
     }
   }
@@ -217,6 +243,7 @@ object ErgoSettingsReader extends ScorexLogging
     * (`ergo.chain.yolo.enabled`); a node with one set and not the other would reject or orphan every block.
     * With the switch on, the difficulty settings must also suit EIP-37 from genesis: `useLastEpochs` at
     * least 2, `eip37EpochLength` equal to `YoloSettings.Eip37EpochLength`, and an initial difficulty at or above `YoloSettings.MinDifficulty` that nBits represents exactly.
+    * EIP-27 must be off: `reemission.checkReemissionRules = false` and `reemission.activationHeight = Int.MaxValue`.
     *
     * @return error message, or None if the settings are consistent
     */
@@ -253,10 +280,26 @@ object ErgoSettingsReader extends ScorexLogging
       Some(s"ergo.chain.yolo.enabled = true but ergo.chain.initialDifficultyHex = `${chain.initialDifficultyHex}` " +
         s"(${chain.initialDifficulty}) is not exactly representable in nBits " +
         s"(it encodes as ${DifficultySerializer.decodeCompactBits(chain.initialNBits)}), so no genesis header could match it")
+    } else if (yoloOn && chain.reemission.checkReemissionRules) {
+      // EIP-27 rules would reject the YOLO coinbase (it pays no re-emission tokens)
+      Some("ergo.chain.yolo.enabled = true but ergo.chain.reemission.checkReemissionRules = true; " +
+        "EIP-27 re-emission is off on YOLO, set it to false")
+    } else if (yoloOn && chain.reemission.activationHeight != Int.MaxValue) {
+      Some(s"ergo.chain.yolo.enabled = true but ergo.chain.reemission.activationHeight = " +
+        s"${chain.reemission.activationHeight}; EIP-27 re-emission never activates on YOLO, set it to ${Int.MaxValue}")
     } else {
       None
     }
   }
+
+  /**
+    * YOLO launch check: with the switch on, the YOLO genesis inputs in `ergo.chain.yolo.emission` must be
+    * complete and consistent (`YoloGenesis.launchError`, ten conditions: 1 to 8, 4b and 4c). None with the switch off.
+    *
+    * @return error message, or None if there is nothing to refuse
+    */
+  protected[settings] def yoloGenesisError(settings: ErgoSettings): Option[String] =
+    YoloGenesis.launchError(settings.chainSettings)
 
   private def consistentSettings(settings: ErgoSettings,
                                  desiredNetworkTypeOpt: Option[NetworkType]): ErgoSettings = {
@@ -291,7 +334,13 @@ object ErgoSettingsReader extends ScorexLogging
       failWithError("nodeSettings.popowBootstrap is set but genesisId is not")
     } else if (yoloSettingsError(settings).isDefined) {
       failWithError(yoloSettingsError(settings).get)
+    } else if (yoloGenesisError(settings).isDefined) {
+      failWithError(yoloGenesisError(settings).get)
     } else {
+      // the launch check has passed; a devnet setting that lets a fund keep the public test signer keys is shown
+      if (settings.chainSettings.yolo.enabled) {
+        YoloGenesis.testSignerKeysWarning(settings.chainSettings.yolo.emission).foreach(w => log.error(w))
+      }
       settings
     }
   }

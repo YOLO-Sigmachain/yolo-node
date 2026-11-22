@@ -4,7 +4,7 @@ import sigmastate.utils.Helpers._
 import org.ergoplatform.ErgoAddressEncoder
 import org.ergoplatform.mining.AutolykosPowScheme
 import org.ergoplatform.mining.difficulty.DifficultySerializer
-import org.ergoplatform.mining.emission.EmissionRules
+import org.ergoplatform.mining.emission.{EmissionRules, YoloEmissionRules}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import scorex.crypto.authds.ADDigest
@@ -42,6 +42,14 @@ case class ChainSettings(protocolVersion: Byte,
     .fold(_ => throw new Error(s"Failed to parse genesisStateDigestHex = $genesisStateDigestHex"), ADDigest @@ _)
 
   val emissionRules: EmissionRules = new EmissionRules(monetary)
+
+  /**
+    * YOLO emission rules for the configured genesis emission value, beside the Ergo `emissionRules` above
+    * (which stay as upstream). Some only when the YOLO switch is on; the start-up check refuses a YOLO config whose
+    * genesis value is not positive, so on a running YOLO node this is always defined.
+    */
+  lazy val yoloEmissionRulesOpt: Option[YoloEmissionRules] =
+    if (yolo.enabled) Some(new YoloEmissionRules(yolo.emission.genesisValue)) else None
 
   val addressEncoder = new ErgoAddressEncoder(addressPrefix)
 

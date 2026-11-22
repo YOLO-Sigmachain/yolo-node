@@ -40,6 +40,7 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.scorexSettings.network.nodeName should startWith("yolo-")
     s.chainSettings.blockInterval shouldBe 30.seconds
     s.nodeSettings.headerChainDiff shouldBe 400
+    s.chainSettings.reemission.activationHeight shouldBe Int.MaxValue
     s.chainSettings.powScheme.getClass shouldBe classOf[AutolykosPowScheme]
     s.chainSettings.powScheme.powHeightDivisor shouldBe 4
     s.chainSettings.powScheme.k shouldBe 32
@@ -73,23 +74,47 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     s.chainSettings.reemission.checkReemissionRules shouldBe false
   }
 
+  // yolo-testnet.conf ships no genesis inputs: the emission block is unset and the digest is testnet.conf's
+  private def checkYoloTestnetGenesisUnset(s: ErgoSettings): Unit = {
+    s.chainSettings.yolo.emission shouldBe YoloEmissionSettings()
+    s.chainSettings.genesisStateDigestHex shouldBe "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502"
+  }
+
+  // read without the start-up checks: a node started on yolo-testnet.conf alone refuses (genesis inputs unset),
+  // and a refusal exits the JVM
   property("yolo-testnet.conf read with --testnet gives the YOLO values") {
     val s = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
     checkYoloTestnet(s)
+    checkYoloTestnetGenesisUnset(s)
     s.scorexSettings.network.allowLocal shouldBe false
   }
 
   property("yolo-testnet.conf read without --testnet gives the same values (it includes testnet.conf)") {
     val s = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), None))
     checkYoloTestnet(s)
+    checkYoloTestnetGenesisUnset(s)
     s.scorexSettings.network.allowLocal shouldBe false
   }
 
-  property("yolo-devnet.conf is yolo-testnet.conf with local peers allowed") {
-    // the full, checked read: the devnet conf passes every start-up check
+  property("yolo-devnet.conf is yolo-testnet.conf with local peers allowed and the devnet genesis inputs") {
+    // the full, checked read: the devnet conf passes every start-up check, the YOLO launch check included
     val s = ErgoSettingsReader.read(Args(Some(yoloDevnetPath), Some(NetworkType.TestNet)))
     checkYoloTestnet(s)
     s.scorexSettings.network.allowLocal shouldBe true
+    val e = s.chainSettings.yolo.emission
+    e.emissionNftId shouldBe "44bc63258d371f08ba0ac4b87eb356cf8e84dbfa31afef89a5b4a953cabdad2a"
+    e.treasuryNftId shouldBe "26adf62f0d439cd5cccaad2343e2768085d7def9a0230a9251ce8477581f9148"
+    e.lpNftId shouldBe "d6f3e22aca5641481ec05e2f134f451bfe11e489820eb149181e59eae7ce6967"
+    e.genesisValue shouldBe 177291250000000000L
+    e.treasuryFundValue shouldBe 100000000000L
+    e.lpFundValue shouldBe 100000000000L
+    e.lpWhitelist shouldBe Seq.empty
+    // the devnet fund trees hold the public test signer keys, which only the devnet allows
+    e.allowTestSignerKeys shouldBe true
+    Seq(e.emissionTreeHex, e.treasuryAccumulationTreeHex, e.lpAccumulationTreeHex, e.treasuryFundTreeHex,
+      e.lpFundTreeHex).foreach(_ should not be empty)
+    s.chainSettings.genesisStateDigestHex should not be
+      "cb63aa99a3060f341781d8662b58bf18b9ad258db4fe88d09f8f71cb668cad4502"
   }
 
   property("the upstream test settings have the switch off and divisor 1") {
@@ -108,6 +133,22 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     ErgoSettingsReader.yoloSettingsError(ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), None))) shouldBe None
     ErgoSettingsReader.yoloSettingsError(ErgoSettingsReader.read(Args(Some(yoloDevnetPath), Some(NetworkType.TestNet)))) shouldBe None
     ErgoSettingsReader.yoloSettingsError(settings) shouldBe None
+  }
+
+  property("start-up check: yolo-devnet.conf and the upstream test settings pass the YOLO launch check; " +
+    "yolo-testnet.conf is refused and the message names every missing input") {
+    ErgoSettingsReader.yoloGenesisError(ErgoSettingsReader.read(Args(Some(yoloDevnetPath), Some(NetworkType.TestNet)))) shouldBe None
+    ErgoSettingsReader.yoloGenesisError(settings) shouldBe None
+
+    Seq(Some(NetworkType.TestNet), None).foreach { t =>
+      val err = ErgoSettingsReader.yoloGenesisError(ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), t)))
+      err shouldBe defined
+      err.get should include("ergo.chain.yolo.emission")
+      Seq("emissionTreeHex", "treasuryAccumulationTreeHex", "lpAccumulationTreeHex", "treasuryFundTreeHex",
+        "lpFundTreeHex", "emissionNftId", "treasuryNftId", "lpNftId").foreach { field =>
+        err.get should include(s"$field: unset")
+      }
+    }
   }
 
   property("start-up check refuses the YOLO switch on a network type other than testnet") {
@@ -214,6 +255,42 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
         powScheme = new AutolykosPowScheme(32, 26, 1)))) shouldBe None
   }
 
+  property("start-up check refuses YOLO with EIP-27 re-emission rules checked (checkReemissionRules = true)") {
+    // with the rules checked and activationHeight = 1, the honest height-1 YOLO coinbase is rejected (it pays no
+    // re-emission tokens), so the switch on requires checkReemissionRules = false
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    yolo.chainSettings.reemission.checkReemissionRules shouldBe false
+    def withCheck(check: Boolean, height: Int): ErgoSettings = yolo.copy(chainSettings = yolo.chainSettings.copy(
+      reemission = yolo.chainSettings.reemission.copy(checkReemissionRules = check, activationHeight = height)))
+    Seq(Int.MaxValue, 1).foreach { h =>
+      val err = ErgoSettingsReader.yoloSettingsError(withCheck(check = true, h))
+      withClue(s"activationHeight = $h: ") {
+        err shouldBe defined
+        err.get should include("ergo.chain.reemission.checkReemissionRules = true")
+      }
+    }
+    ErgoSettingsReader.yoloSettingsError(withCheck(check = false, Int.MaxValue)) shouldBe None
+    // switch off: upstream, not checked here
+    ErgoSettingsReader.yoloSettingsError(settings.copy(chainSettings = settings.chainSettings.copy(
+      reemission = settings.chainSettings.reemission.copy(checkReemissionRules = true)))) shouldBe None
+  }
+
+  property("start-up check refuses YOLO with an EIP-27 activation height other than Int.MaxValue") {
+    val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+    yolo.chainSettings.reemission.activationHeight shouldBe Int.MaxValue
+    Seq(1, 0, 777217, 100000001, Int.MaxValue - 1).foreach { h =>
+      val err = ErgoSettingsReader.yoloSettingsError(yolo.copy(chainSettings = yolo.chainSettings.copy(
+        reemission = yolo.chainSettings.reemission.copy(activationHeight = h))))
+      withClue(s"activationHeight = $h: ") {
+        err shouldBe defined
+        err.get should include(s"ergo.chain.reemission.activationHeight = $h")
+      }
+    }
+    // switch off: upstream values (the upstream test settings activate EIP-27 at a finite height)
+    settings.chainSettings.reemission.activationHeight should not be Int.MaxValue
+    ErgoSettingsReader.yoloSettingsError(settings) shouldBe None
+  }
+
   property("start-up check refuses a YOLO initial difficulty that nBits cannot represent exactly") {
     val yolo = ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
     def withDiff(hex: String): ErgoSettings = yolo.copy(chainSettings = yolo.chainSettings.copy(initialDifficultyHex = hex))
@@ -235,8 +312,67 @@ class YoloConfigSpec extends ErgoCorePropertyTest {
     typo shouldBe defined
     typo.get should include("ergo.chain.yolo.enable")
 
+    val emissionTypo = check("ergo.chain.yolo { enabled = true, emission { genesisValu = 1 } }")
+    emissionTypo shouldBe defined
+    emissionTypo.get should include("ergo.chain.yolo.emission.genesisValu")
+
+    // the old key names treasuryTreeHex and lpTreeHex are refused, so an old config cannot silently drop its
+    // accumulation trees
+    val renamed = check("ergo.chain.yolo { emission { treasuryTreeHex = \"\", lpTreeHex = \"\" } }")
+    renamed shouldBe defined
+    renamed.get should include("ergo.chain.yolo.emission.treasuryTreeHex")
+    renamed.get should include("ergo.chain.yolo.emission.lpTreeHex")
+
+    // whitelist entries: unknown keys in an entry are refused too
+    val entryTypo = check("ergo.chain.yolo { emission { lpWhitelist = [ { hash = \"00\", heigth = 0 } ] } }")
+    entryTypo shouldBe defined
+    entryTypo.get should include("ergo.chain.yolo.emission.lpWhitelist.0.heigth")
+    val secondEntry = check(
+      "ergo.chain.yolo { emission { lpWhitelist = [ { hash = \"00\", height = 0 }, { hash = \"00\", h = 0 } ] } }")
+    secondEntry shouldBe defined
+    secondEntry.get should include("ergo.chain.yolo.emission.lpWhitelist.1.h")
+
     check("ergo.chain { }") shouldBe None
     check("ergo.chain.yolo { }") shouldBe None
+    check(
+      """ergo.chain.yolo {
+        |  enabled = true
+        |  softForkVotingStartHeight = 0
+        |  emission {
+        |    emissionTreeHex = "", treasuryAccumulationTreeHex = "", lpAccumulationTreeHex = ""
+        |    treasuryFundTreeHex = "", lpFundTreeHex = ""
+        |    emissionNftId = "", treasuryNftId = "", lpNftId = ""
+        |    genesisValue = 0, treasuryFundValue = 0, lpFundValue = 0
+        |    lpWhitelist = [ { hash = "00", height = 0 } ]
+        |    allowTestSignerKeys = false
+        |  }
+        |}""".stripMargin) shouldBe None
+  }
+
+  property("start-up check: the public test signer keys are refused unless allowTestSignerKeys = true, " +
+    "which only yolo-devnet.conf sets") {
+    val devnet = ErgoSettingsReader.read(Args(Some(yoloDevnetPath), Some(NetworkType.TestNet)))
+    devnet.chainSettings.yolo.emission.allowTestSignerKeys shouldBe true
+    ErgoSettingsReader.yoloGenesisError(devnet) shouldBe None
+
+    // the same genesis inputs with the setting off, as on any network other than the local devnet
+    val off = devnet.copy(chainSettings = devnet.chainSettings.copy(yolo = devnet.chainSettings.yolo.copy(
+      emission = devnet.chainSettings.yolo.emission.copy(allowTestSignerKeys = false))))
+    val err = ErgoSettingsReader.yoloGenesisError(off)
+    err shouldBe defined
+    err.get should include("treasuryFundTreeHex holds a public test signer key")
+    err.get should include("lpFundTreeHex holds a public test signer key")
+    err.get should include("ergo.chain.yolo.emission.allowTestSignerKeys = true")
+
+    // off by default: yolo-testnet.conf leaves it unset, and the main application.conf says false
+    ErgoSettingsReader.readUnchecked(Args(Some(yoloTestnetPath), Some(NetworkType.TestNet)))
+      .chainSettings.yolo.emission.allowTestSignerKeys shouldBe false
+    YoloEmissionSettings().allowTestSignerKeys shouldBe false
+    val mainAppConf = getClass.getClassLoader.getResources("application.conf").asScala.toSeq
+      .find(u => !u.toString.contains("test-classes")).get
+    ConfigFactory.parseURL(mainAppConf).getBoolean("ergo.chain.yolo.emission.allowTestSignerKeys") shouldBe false
+    ConfigFactory.parseFile(new File(yoloTestnetPath)).hasPath("ergo.chain.yolo.emission.allowTestSignerKeys") shouldBe
+      false
   }
 
   property("the shipped yolo blocks (yolo-testnet.conf, yolo-devnet.conf, main application.conf) have no unknown keys") {

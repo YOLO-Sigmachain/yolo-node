@@ -258,7 +258,7 @@ object ErgoState extends ScorexLogging {
   /**
     * Helper method used to construct boxes for pre-genesis state (state before a genesis block)
     */
-  private def createGenesisBox(value: Long,
+  private[state] def createGenesisBox(value: Long,
                         ergoTree: ErgoTree,
                         additionalTokens: Seq[(TokenId, Long)] = Seq.empty,
                         additionalRegisters: AdditionalRegisters = Map.empty): ErgoBox = {
@@ -304,7 +304,7 @@ object ErgoState extends ScorexLogging {
     * Genesis box that contains proofs of no premine.
     * It is a long-living box with special bytes in registers
     */
-  private def noPremineBox(chainSettings: ChainSettings): ErgoBox = {
+  private[state] def noPremineBox(chainSettings: ChainSettings): ErgoBox = {
     val proofsBytes = chainSettings.noPremineProof.map(b => ByteArrayConstant(b.getBytes("UTF-8")))
     val proofs = ErgoBox.nonMandatoryRegisters.zip(proofsBytes).toMap
     createGenesisBox(EmissionRules.CoinsInOneErgo, FalseTree, Seq.empty, proofs)
@@ -313,10 +313,15 @@ object ErgoState extends ScorexLogging {
   /**
     * Genesis state boxes generator.
     * Genesis state is corresponding to the state before the very first block processed.
-    * For Ergo mainnet, contains emission contract box, proof-of-no--premine box, and treasury contract box
+    * For Ergo mainnet, contains emission contract box, proof-of-no--premine box, and treasury contract box.
+    * With the YOLO switch on, the YOLO genesis boxes instead (`YoloGenesis.genesisBoxes`), emission box first.
     */
   def genesisBoxes(chainSettings: ChainSettings): Seq[ErgoBox] = {
-    Seq(genesisEmissionBox(chainSettings), noPremineBox(chainSettings), genesisFoundersBox(chainSettings))
+    if (chainSettings.yolo.enabled) {
+      YoloGenesis.genesisBoxes(chainSettings)
+    } else {
+      Seq(genesisEmissionBox(chainSettings), noPremineBox(chainSettings), genesisFoundersBox(chainSettings))
+    }
   }
 
   /**

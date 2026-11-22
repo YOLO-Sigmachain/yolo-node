@@ -1024,7 +1024,7 @@ object ExtraIndexer {
   }
 
   /**
-    * Token row of a token held by a genesis box: created by that box,
+    * Token row of a token held by a genesis box (on YOLO the emission, treasury and LP NFTs): created by that box,
     * with the amount it holds, and no name, description or decimals - the registers of the genesis boxes are
     * contract state, not token metadata. No transaction mints these tokens (genesis boxes are inserted into the
     * state directly), so the indexer writes the row when it indexes the genesis boxes, in the same batch as them

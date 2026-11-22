@@ -75,8 +75,14 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
     * @return emission box from this block transactions
     */
   protected[state] def extractEmissionBox(fb: ErgoFullBlock): Option[ErgoBox] = {
+    val yolo = ergoSettings.chainSettings.yolo
+
     def hasEmissionBox(tx: ErgoTransaction): Boolean =
-      if(fb.height > ergoSettings.chainSettings.reemission.activationHeight) {
+      if (yolo.enabled) {
+        // YOLO: the emission tree AND the emission NFT at tokens(0) with amount 1; a lookalike box at the
+        // emission script with another token, or none, is not the emission box
+        yolo.emission.isEmissionBox(tx.outputs.head)
+      } else if(fb.height > ergoSettings.chainSettings.reemission.activationHeight) {
         // after EIP-27 we search for emission box NFT for efficiency's sake
         val emissionNftId = ergoSettings.chainSettings.reemission.emissionNftIdBytes
         val outTokens = tx.outputs.head.additionalTokens
@@ -90,7 +96,9 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
       fb.transactions
         .find(hasEmissionBox)
         .map(_.outputs.head)
-        .filter(_.value > 100000 * EmissionRules.CoinsInOneErgo) // to filter out possible spam
+        // to filter out possible spam; on YOLO the NFT check in hasEmissionBox replaces it, as the YOLO
+        // emission box holds less than 100,000 coins in its last blocks
+        .filter(b => yolo.enabled || b.value > 100000 * EmissionRules.CoinsInOneErgo)
     }
 
     emissionBoxIdOpt match {
