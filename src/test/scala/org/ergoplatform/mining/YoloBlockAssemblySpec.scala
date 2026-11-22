@@ -20,7 +20,7 @@ import org.ergoplatform.settings.{Args, ErgoSettings, ErgoSettingsReader, ErgoVa
   YoloEmissionSettings, YoloLaunchParameters}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, StorageRentTestHelpers}
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
-import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
+import org.ergoplatform.{DataInput, ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input}
 import scorex.util.{ModifierId, bytesToId}
 import sigma.Colls
 import sigma.Extensions.CollBytesOps
@@ -40,7 +40,10 @@ import scala.util.{Failure, Success, Try}
   * of `StorageRentClaimBuilder.MaxClaims` = 100 boxes and the fee transaction take their share of the block first.
   *
   * A pool transaction at the relay limit (`ergo.node.maxTransactionCost` in yolo-testnet.conf) is included beside
-  * them, and the measured cost of each piece is reported.
+  * them, and the measured cost of each piece is reported. With the switch on, a valid pool transaction that does not
+  * fit in what is left is passed over (`YoloAssemblyPolicy`, which has no limit on how many), is
+  * not reported as invalid, and the transactions behind it are included; with the switch off assembly ends at it, as
+  * upstream.
   */
 class YoloBlockAssemblySpec extends ErgoCorePropertyTest with StorageRentTestHelpers {
   import org.ergoplatform.utils.ErgoCoreTestConstants.{defaultMinerPk, defaultMinerSecretNumber, defaultTimestamp,
@@ -252,6 +255,13 @@ class YoloBlockAssemblySpec extends ErgoCorePropertyTest with StorageRentTestHel
       (change +: (feeOut ++ padOuts)).toIndexedSeq)
   }
 
+  /** Spends output `idx` of `parent` (a `true` box) into a change output and a fee output */
+  private def childTx(parent: ErgoTransaction, idx: Int = 0): ErgoTransaction = {
+    val in = parent.outputs(idx)
+    ErgoTransaction(IndexedSeq(new Input(in.id, ProverResult.empty)), IndexedSeq.empty,
+      IndexedSeq(new ErgoBoxCandidate(in.value - Fee, TrueTree, next), new ErgoBoxCandidate(Fee, feeProp, next)))
+  }
+
   private def costOf(us: UtxoState, ctx: ErgoStateContext, tx: ErgoTransaction): Int =
     us.validateWithCost(tx, ctx, BlockCost, None).get
 
@@ -443,6 +453,186 @@ class YoloBlockAssemblySpec extends ErgoCorePropertyTest with StorageRentTestHel
 
     // the candidate, proven with the test PoW scheme, is a valid block (rule 308 attestation included)
     applyCandidate(us, block).boxById(atLimit.outputs.head.id) shouldBe defined
+  }
+
+  property("switch on: a valid pool tx that does not fit beside the rent claim is skipped, not reported invalid, " +
+    "and the ones behind it are included; switch off: assembly ends at it, as upstream") {
+    val us = stateAtTip()
+    val ctx = upcoming(us)
+    // cost 1,200,000, the relay limit before: valid on its own (under the 1,350,000 budget), but not beside the
+    // emission tx and the rent claim
+    val oversized = txAtCost(us, ctx, forOversized, 1200000)
+    costOf(us, ctx, oversized) should be < Budget
+    val small1 = payTx(forSmall.slice(0, 1))
+    val small2 = payTx(forSmall.slice(1, 3))
+    val pool = Seq(oversized, small1, small2)
+
+    // switch on (the YOLO candidate path)
+    val (on, onEliminated) = candidate(us, devnet, pool)
+    onEliminated shouldBe empty
+    on.transactions.map(_.id).contains(oversized.id) shouldBe false
+    on.transactions.size shouldBe 5
+    isRentClaim(on.transactions(1)) shouldBe true
+    on.transactions.slice(2, 4).map(_.id) shouldBe Seq(small1.id, small2.id)
+    // the fee tx collects the two small txs' fees
+    on.transactions(4).inputs.map(i => bytesToId(i.boxId)) should contain theSameElementsAs
+      Seq(small1, small2).map(t => bytesToId(t.outputs(1).id))
+
+    // switch off: the same state and pool, assembly ends at the oversized tx; nothing is reported invalid
+    val (off, offEliminated) = candidate(us, switchOff, pool)
+    offEliminated shouldBe empty
+    off.transactions.size shouldBe 2
+    isRentClaim(off.transactions(1)) shouldBe true
+  }
+
+  /**
+    * Fixture for the collectTxs-level checks, under a budget chosen so that `a`, then `small` (with the fee tx) fit
+    * but `a` and any of `bigs` do not: `bigs` cost as much as `a`, `small` far less
+    */
+  private case class Fixture(us: UtxoState, ctx: UpcomingStateContext, a: ErgoTransaction, bigs: Seq[ErgoTransaction],
+                             small: ErgoTransaction, budget: Int) {
+    /**
+      * The YOLO assembly loop (switch on) under this fixture's budget: `mandatory` first (the emission, prioritized
+      * and claim slots), `droppable` among them, then `pool` with no record
+      */
+    def yolo(mandatory: Seq[ErgoTransaction], pool: Seq[ErgoTransaction],
+             droppable: Set[ModifierId] = Set.empty): YoloAssemblyPolicy.Result =
+      YoloAssemblyPolicy.collect(defaultMinerPk, us, ctx, budget, relayLimit, mandatory, droppable,
+        pool.map(YoloAssemblyPolicy.PoolTx(_, None)))
+    /** The node's call shape with the switch off (createCandidate calls collectTxs as upstream) */
+    def switchOffCall(txs: Seq[ErgoTransaction]): (Seq[ModifierId], Seq[ModifierId]) = {
+      val (in, invalid) = CandidateGenerator.collectTxs(defaultMinerPk, budget, ctx.currentParameters.maxBlockSize,
+        us, ctx, txs)
+      in.map(_.id) -> invalid
+    }
+    /** Upstream v6.0.8 itself (the reference copy) */
+    def upstream(txs: Seq[ErgoTransaction]): (Seq[ModifierId], Seq[ModifierId]) = {
+      val (in, invalid) = UpstreamV608Assembly.collectTxs(defaultMinerPk, budget, ctx.currentParameters.maxBlockSize,
+        us, ctx, txs)
+      in.map(_.id) -> invalid
+    }
+  }
+
+  private def fixture(fee: Long, s: ErgoSettings = devnet): Fixture = {
+    val us = stateAtTip(s)
+    val ctx = upcoming(us)
+    val a = payTx(forOversized.slice(0, 20), fee)
+    val bigs = (0 until 7).map(i => payTx(forOversized.slice(20 + 20 * i, 40 + 20 * i), fee))
+    val small = payTx(forSmall.slice(0, 1), fee)
+    val feeCost = if (fee > 0) feeTxOf(ctx, Seq(a, small))._2 else 0
+    // a + small + fee tx fit, with less spare than one big costs
+    val budget = costOf(us, ctx, a) + costOf(us, ctx, small) + feeCost + 1000
+    bigs.foreach(b => costOf(us, ctx, b) should be > 1000)
+    costOf(us, ctx, small) should be < costOf(us, ctx, a)
+    Fixture(us, ctx, a, bigs, small, budget)
+  }
+
+  // Valid txs that do not fit are not reported invalid and the txs behind them are still collected, for any number
+  // of them, and they are passed over without being validated
+  property("YOLO assembly loop: valid txs that do not fit never end assembly, however many, in both the fee and the " +
+    "no-fee branch; they are passed over at zero work and never reported invalid") {
+    Seq(Fee, 0L).foreach { fee =>
+      withClue(s"fee $fee: ") {
+        val f = fixture(fee)
+        val feeTxs = if (fee > 0) 1 else 0
+        Seq(1, 5, 6, 7).foreach { k =>
+          val res = f.yolo(Seq.empty, f.a +: f.bigs.take(k) :+ f.small)
+          res.invalid shouldBe empty
+          res.refusedBoxIds shouldBe empty
+          res.txs.take(2).map(_.id) shouldBe Seq(f.a.id, f.small.id)
+          res.txs.size shouldBe 2 + feeTxs
+          f.bigs.take(k).foreach(b => res.outcomeOf(b.id) shouldBe Some(YoloAssemblyPolicy.Outcome.NoRoom))
+          res.zUsed shouldBe 0L
+        }
+        // the switch-off call: assembly ends at the first oversized tx, as upstream
+        val (none, noneInvalid) = f.switchOffCall(f.a +: f.bigs.take(1) :+ f.small)
+        noneInvalid shouldBe empty
+        none.size shouldBe 1 + feeTxs
+      }
+    }
+  }
+
+  property("switch off: collectTxs gives exactly what upstream v6.0.8 gives (pinned against a reference copy of " +
+    "upstream's code), in the fee and the no-fee branch, with fee outputs carrying tokens, and with invalid txs") {
+    Seq(Fee, 0L).foreach { fee =>
+      withClue(s"fee $fee: ") {
+        val f = fixture(fee, switchOff)
+        f.ctx.chainSettings.yolo.enabled shouldBe false
+        val orphan = childTx(f.bigs(1))
+        val tokenA = tokenFeeTx(forTokenFee(0))
+        val tokenB = tokenFeeTx(forTokenFee(1))
+        val cases: Seq[Seq[ErgoTransaction]] = Seq(
+          Seq(f.a, f.small),
+          f.a +: f.bigs.take(1) :+ f.small,
+          f.a +: f.bigs.take(6) :+ f.small,
+          Seq(f.a, orphan, f.small),
+          Seq(f.a, f.bigs.head, childTx(f.bigs.head), f.small),
+          Seq(tokenA, tokenB, f.small),
+          Seq(tokenA, f.small, tokenB))
+        cases.foreach { txs =>
+          val up = f.upstream(txs)
+          f.switchOffCall(txs) shouldBe up
+          // the call shape without the new arguments is the same
+          val (in, invalid) = CandidateGenerator.collectTxs(defaultMinerPk, f.budget,
+            f.ctx.currentParameters.maxBlockSize, f.us, f.ctx, txs)
+          (in.map(_.id) -> invalid) shouldBe up
+        }
+      }
+    }
+  }
+
+  // Mandatory, droppable, dependent and orphaned txs on the YOLO assembly loop
+  property("YOLO assembly loop: a mandatory tx that does not fit ends assembly, as upstream, unless it is droppable " +
+    "(the miner's own rent claim); a tx spending or reading an output of a tx passed over is left out with it and " +
+    "not reported invalid; a tx missing its input is reported invalid, as upstream") {
+    val f = fixture(Fee)
+    val big = f.bigs.head
+
+    // a mandatory tx overflowing: assembly ends there
+    val mandatory = f.yolo(Seq(f.a, big), Seq(f.small))
+    mandatory.invalid shouldBe empty
+    mandatory.txs.head.id shouldBe f.a.id
+    mandatory.txs.size shouldBe 2
+
+    // children of a tx passed over (one spending its change, one spending that child's change): left out, not invalid;
+    // the small tx behind them still gets in
+    val child = childTx(big)
+    val grandchild = childTx(child)
+    val cascade = f.yolo(Seq(f.a), Seq(big, child, grandchild, f.small))
+    cascade.invalid shouldBe empty
+    cascade.txs.map(_.id).take(2) shouldBe Seq(f.a.id, f.small.id)
+    cascade.txs.size shouldBe 3
+    Seq(child, grandchild).foreach(t => cascade.outcomeOf(t.id) shouldBe Some(YoloAssemblyPolicy.Outcome.Dependent))
+
+    // a tx genuinely missing its input is still reported invalid, as upstream, and its inputs are not refused
+    val orphan = childTx(f.bigs(1))
+    val orphaned = f.yolo(Seq(f.a), Seq(orphan, f.small))
+    orphaned.invalid shouldBe Seq(orphan.id)
+    orphaned.refusedBoxIds shouldBe empty
+
+    // a tx reading an output of a tx passed over through a data input: left out with it, not reported invalid
+    val readerInput = forSmall(200)
+    val reader = ErgoTransaction(IndexedSeq(new Input(readerInput.id, ProverResult.empty)),
+      IndexedSeq(DataInput(big.outputs.head.id)),
+      IndexedSeq(new ErgoBoxCandidate(readerInput.value - Fee, TrueTree, next), new ErgoBoxCandidate(Fee, feeProp, next)))
+    // valid on its own once the data box exists: what keeps it out is the data-input clause, not a missing input
+    f.us.withTransactions(Seq(big)).validateWithCost(reader, f.ctx, f.budget, None) shouldBe a[Success[_]]
+    val read = f.yolo(Seq(f.a), Seq(big, reader, f.small))
+    read.invalid shouldBe empty
+    read.txs.map(_.id).take(2) shouldBe Seq(f.a.id, f.small.id)
+    read.txs.map(_.id) should not contain reader.id
+    read.txs.size shouldBe 3
+
+    // a droppable mandatory tx that does not fit is left out, not reported invalid, and assembly goes on
+    val Seq(big0, big1) = f.bigs.take(2)
+    val dropped = f.yolo(Seq(f.a, big0), Seq(big1, f.small), droppable = Set(big0.id))
+    dropped.invalid shouldBe empty
+    dropped.txs.map(_.id).take(2) shouldBe Seq(f.a.id, f.small.id)
+    dropped.txs.size shouldBe 3
+    // without the drop, big0 ends assembly before small
+    val stopped = f.yolo(Seq(f.a, big0), Seq(big1, f.small))
+    stopped.invalid shouldBe empty
+    stopped.txs.map(_.id) should not contain f.small.id
   }
 
   property("rent claim cost bound: never below the measured cost, for boxes without tokens, with many distinct " +
@@ -644,6 +834,39 @@ class YoloBlockAssemblySpec extends ErgoCorePropertyTest with StorageRentTestHel
           }
         }
     }
+  }
+
+  property("switch on: a rent claim that does not fit beside the prioritized txs is dropped from the candidate, the " +
+    "pool txs behind it get in, nothing is eliminated and the rent index stays intact; switch off: assembly ends " +
+    "at the claim, as upstream") {
+    val us = stateAtTip()
+    val ctx = upcoming(us)
+    val prioritized = txAtCost(us, ctx, forOversized, 1150000)
+    val small1 = payTx(forSmall.slice(0, 1))
+    val small2 = payTx(forSmall.slice(1, 3))
+    // the claim does fit on its own, it is the room left that is too small
+    costOf(us, ctx, rentClaim()) should be < CandidateGenerator.YoloRentClaimCostBudget
+
+    val (on, onEliminated, onHistory) = candidateWith(us, devnet, Seq(small1, small2), rentBoxes, Seq(prioritized))
+    onEliminated shouldBe empty
+    on.transactions.exists(isRentClaim) shouldBe false
+    on.transactions.map(_.id).slice(1, 4) shouldBe Seq(prioritized.id, small1.id, small2.id)
+    on.transactions.size shouldBe 5
+    rentEntries(onHistory) shouldBe 100
+    applyCandidate(us, on)
+
+    val usOff = stateAtTip(switchOff)
+    val (off, offEliminated, offHistory) = candidateWith(usOff, switchOff, Seq(small1, small2), rentBoxes,
+      Seq(prioritized))
+    offEliminated shouldBe empty
+    off.transactions.size shouldBe 3
+    off.transactions(1).id shouldBe prioritized.id
+    off.transactions.exists(isRentClaim) shouldBe false
+    rentEntries(offHistory) shouldBe 100
+    // pinned: upstream's collectTxs over the same transactions gives the same candidate
+    val ctxOff = upcoming(usOff)
+    UpstreamV608Assembly.collectTxs(defaultMinerPk, Budget, ctxOff.currentParameters.maxBlockSize, usOff, ctxOff,
+      Seq(emissionTx(us), prioritized, rentClaim(), small1, small2))._1.map(_.id) shouldBe off.transactions.map(_.id)
   }
 
   property("switch on: fee outputs carrying many tokens never end assembly (two txs paying fee " +
@@ -955,6 +1178,91 @@ class YoloBlockAssemblySpec extends ErgoCorePropertyTest with StorageRentTestHel
         }
       }
     }
+  }
+
+  property("switch on: a tx whose fee outputs make the fee tx never fit (K past the fit boundary, up to 713) or " +
+    "invalid (714 and more, e.g. 730) is passed over, not reported invalid, and a small tx behind " +
+    "it gets in, as a pool tx; as a prioritized tx it ends assembly as any prioritized tx that does not fit; switch " +
+    "off: upstream's stop, pinned") {
+    val us = stateAtTip()
+    val usOff = stateAtTip(switchOff)
+    val ctx = upcoming(us)
+    val ctxOff = upcoming(usOff)
+    val emission = emissionTx(us)
+    val claim = rentClaim()
+    val small = payTx(forSmall.slice(0, 1))
+    val mandatory = costOf(us, ctx, emission) + costOf(us, ctx, claim)
+    def total(k: Int): Try[Int] = feeTxTry(ctx, Seq(manyFeesTx(k)))._3.map(_ + mandatory + costOf(us, ctx, manyFeesTx(k)))
+    // the largest K whose tx and fee tx fit beside the emission tx and the 100-box claim (costs grow linearly)
+    val step = total(2).get - total(1).get
+    val kFit = (Budget - 1 - total(1).get) / step + 1
+    total(kFit).get should be < Budget
+    total(kFit + 1).get should be >= Budget
+    total(713).get should be >= Budget
+    total(714).isFailure shouldBe true
+    info(s"largest K that fits beside the emission tx and the 100-box claim: $kFit (${total(kFit).get} of $Budget)")
+
+    def upstream(txs: Seq[ErgoTransaction]): Seq[ModifierId] =
+      UpstreamV608Assembly.collectTxs(defaultMinerPk, Budget, ctxOff.currentParameters.maxBlockSize, usOff, ctxOff,
+        txs)._1.map(_.id)
+
+    // The YOLO loop reserves the fee tx by its bound (base plus 2,100 per fee box) instead of validating
+    // it after each tx; the measured fee script costs 89, so the bound is 11 per fee box above the measured cost.
+    // The largest K that fits by the bound is below kFit, so the tx at kFit (which fits the measured fee tx by less
+    // than one step) is not included
+    val claimCost = costOf(us, ctx, claim)
+    val emissionCost = costOf(us, ctx, emission)
+    def fitsByBound(k: Int): Boolean = costOf(us, ctx, manyFeesTx(k)) <=
+      Budget - 1L - emissionCost - claimCost - YoloFeeOutputPolicy.feeTxBaseCost(ctx.currentParameters) - 2100L * k
+    val kFitBound = Iterator.from(1).takeWhile(fitsByBound).toSeq.last
+    kFitBound should be < kFit
+    info(s"largest K that fits by the fee tx bound: $kFitBound")
+
+    Seq(kFitBound, kFit, kFit + 1, 600, 601, 713, 714, 730).foreach { k =>
+      withClue(s"pool tx, K = $k: ") {
+        val attack = manyFeesTx(k)
+        val (on, onEliminated, onHistory) = candidateWith(us, devnet, Seq(attack, small), rentBoxes)
+        onEliminated shouldBe empty
+        on.transactions(1).id shouldBe claim.id
+        on.transactions.map(_.id).contains(attack.id) shouldBe (k <= kFitBound)
+        // past the boundary the tx is passed over and the small one gets in
+        if (k > kFitBound) on.transactions.map(_.id).slice(2, 3) shouldBe Seq(small.id)
+        rentEntries(onHistory) shouldBe 100
+
+        val (off, offEliminated, _) = candidateWith(usOff, switchOff, Seq(attack, small), rentBoxes)
+        offEliminated shouldBe empty
+        off.transactions.map(_.id) shouldBe upstream(Seq(emission, claim, attack, small))
+        if (k > kFit) off.transactions.map(_.id) shouldBe Seq(emission.id, claim.id)
+      }
+    }
+
+    Seq(714, 730).foreach { k =>
+      withClue(s"prioritized tx, K = $k: ") {
+        val attack = manyFeesTx(k)
+        val (on, onEliminated, onHistory) = candidateWith(us, devnet, Seq(small), rentBoxes, Seq(attack))
+        onEliminated shouldBe empty
+        on.transactions.map(_.id) should not contain attack.id
+        // The fee tx is reserved by its bound, so such a prioritized tx does not fit and ends assembly, as any
+        // prioritized tx that does not fit (only the node operator prioritizes a tx), and as upstream does
+        on.transactions.map(_.id) shouldBe Seq(emission.id)
+        rentEntries(onHistory) shouldBe 100
+        val (off, offEliminated, _) = candidateWith(usOff, switchOff, Seq(small), rentBoxes, Seq(attack))
+        offEliminated shouldBe empty
+        off.transactions.map(_.id) shouldBe Seq(emission.id)
+        off.transactions.map(_.id) shouldBe upstream(Seq(emission, attack, claim, small))
+      }
+    }
+
+    // unchanged: a prioritized tx with a valid fee tx that does not fit ends assembly, as any prioritized tx that
+    // does not fit (the mempool would refuse it; only the mining API can place it there)
+    val (stall, stallEliminated, _) = candidateWith(us, devnet, Seq(small), rentBoxes, Seq(manyFeesTx(713)))
+    stallEliminated shouldBe empty
+    stall.transactions.map(_.id) shouldBe Seq(emission.id)
+
+    // 730 fee outputs with the switch on: the candidate is a valid block
+    val usApply = stateAtTip()
+    val (block, _, _) = candidateWith(usApply, devnet, Seq(manyFeesTx(730), small), rentBoxes)
+    applyCandidate(usApply, block).boxById(small.outputs.head.id) shouldBe defined
   }
 
   property("switch on: a sender's two token fee boxes (ground to sort first by id, making the " +

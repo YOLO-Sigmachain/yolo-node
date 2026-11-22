@@ -1,6 +1,7 @@
 package org.ergoplatform.nodeView.mempool
 
 import org.ergoplatform.ErgoBoxCandidate
+import org.ergoplatform.mining.YoloAssemblyPolicy
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.state.{ErgoStateContext, UtxoStateReader}
 import org.ergoplatform.settings.{ChainSettings, Parameters}
@@ -112,6 +113,9 @@ object YoloFeeOutputPolicy {
   /**
     * `state.validateWithCost(tx, context, costLimit, None)` and, with the switch on (`context.chainSettings`), this
     * policy: `checkTokens` before validation (no script is run for a refused transaction) and `checkCost` after it.
+    * With the switch on, the cost limit is the relay limit in use (`YoloAssemblyPolicy.relayLimitInUse`): `costLimit`,
+    * but never above the room a full block leaves for one pool transaction under the parameters of `context`, so that
+    * a vote lowering the block cost limit lowers it too.
     * A refusal is a Failure with a `Refusal`; any other Failure is the validation's. With the switch off it is
     * exactly the validation.
     */
@@ -123,10 +127,11 @@ object YoloFeeOutputPolicy {
     if (!chainSettings.yolo.enabled) {
       state.validateWithCost(tx, context, costLimit, None)
     } else {
+      val limit = YoloAssemblyPolicy.relayLimitInUse(costLimit, context.currentParameters)
       for {
         _ <- checkTokens(tx, chainSettings)
-        cost <- state.validateWithCost(tx, context, costLimit, None)
-        _ <- checkCost(tx, cost.toLong, costLimit.toLong, chainSettings, context.currentParameters)
+        cost <- state.validateWithCost(tx, context, limit, None)
+        _ <- checkCost(tx, cost.toLong, limit.toLong, chainSettings, context.currentParameters)
       } yield cost
     }
   }

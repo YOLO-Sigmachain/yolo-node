@@ -1,7 +1,9 @@
 package org.ergoplatform.nodeView.mempool
 
 import org.ergoplatform.ErgoBoxCandidate
+import org.ergoplatform.ErgoBox
 import org.ergoplatform.ErgoBox.BoxId
+import org.ergoplatform.mining.YoloAssemblyPolicy
 import org.ergoplatform.mining.emission.EmissionRules
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, ErgoTransactionSerializer, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.mempool.OrderedTxPool.WeightedTxId
@@ -27,10 +29,12 @@ import scala.util.{Failure, Success, Try}
   * @param stats    - Mempool statistics, that allows to track
   *                 information about mempool's state and transactions in it.
   * @param sortingOption - this input sets how transactions are sorted in the pool, by fee-per-byte or fee-per-cycle
+  * @param yoloRefused - YOLO switch on only: boxes refused at admission (`YoloRefusedBoxes`); always empty with it off
   */
 class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                                    private[mempool] val stats: MemPoolStatistics,
-                                   private[mempool] val sortingOption: SortingOption)
+                                   private[mempool] val sortingOption: SortingOption,
+                                   val yoloRefused: YoloRefusedBoxes = YoloRefusedBoxes.empty)
                                   (implicit settings: ErgoSettings)
   extends ErgoMemPoolReader with ScorexLogging {
 
@@ -42,6 +46,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
   private val FakeCost = 1000
 
   private val nodeSettings: NodeConfigurationSettings = settings.nodeSettings
+  private def yoloOn: Boolean = settings.chainSettings.yolo.enabled
   private implicit val monetarySettings: MonetarySettings = settings.chainSettings.monetary
 
   override def size: Int = pool.size
@@ -99,7 +104,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     */
   def put(unconfirmedTx: UnconfirmedTransaction): ErgoMemPool = {
     val updatedPool = pool.put(unconfirmedTx, feeFactor(unconfirmedTx))
-    new ErgoMemPool(updatedPool, stats, sortingOption)
+    new ErgoMemPool(updatedPool, stats, sortingOption, yoloRefused)
   }
 
   def put(txs: TraversableOnce[UnconfirmedTransaction]): ErgoMemPool = {
@@ -136,7 +141,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
   def removeTxAndDoubleSpends(tx: ErgoTransaction): ErgoMemPool = {
     def removeTx(mp: ErgoMemPool, tx: ErgoTransaction): ErgoMemPool = {
       log.debug(s"Removing transaction ${tx.id} from the mempool")
-      new ErgoMemPool(mp.pool.remove(tx), mp.updateStatsOnRemoval(tx), sortingOption)
+      new ErgoMemPool(mp.pool.remove(tx), mp.updateStatsOnRemoval(tx), sortingOption, yoloRefused)
     }
 
     val poolWithoutTx = removeTx(this, tx)
@@ -171,7 +176,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     */
   def invalidate(unconfirmedTx: UnconfirmedTransaction): ErgoMemPool = {
     log.debug(s"Invalidating mempool transaction ${unconfirmedTx.id}")
-    new ErgoMemPool(pool.invalidate(unconfirmedTx), updateStatsOnRemoval(unconfirmedTx.transaction), sortingOption)
+    new ErgoMemPool(pool.invalidate(unconfirmedTx), updateStatsOnRemoval(unconfirmedTx.transaction), sortingOption, yoloRefused)
   }
 
   def invalidate(unconfirmedTransactionId: ModifierId): ErgoMemPool = {
@@ -188,6 +193,43 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
         }
     }
   }
+
+  /**
+    * YOLO switch on: refuses `boxIds` at admission from `height` on (`YoloRefusedBoxes`), and evicts (caching their
+    * ids) the pool transactions that spend a box refused now and have no sponsor, such as a copy of a caught
+    * transaction re-made from the same boxes before the refusal arrived. `boxOf` resolves the boxes of sponsor
+    * candidates (from the state and the pool's outputs); one it cannot resolve is not a sponsor.
+    */
+  def yoloRefuse(boxIds: Seq[ModifierId], height: Int, boxOf: BoxId => Option[ErgoBox]): ErgoMemPool = {
+    if (boxIds.isEmpty) {
+      this
+    } else {
+      val refused = yoloRefused.added(boxIds, height)
+      val withRefused = new ErgoMemPool(pool, stats, sortingOption, refused)
+      val boxes = boxIds.toSet
+      val unsponsored = getAll.filter { utx =>
+        utx.transaction.inputs.exists(i => boxes.contains(bytesToId(i.boxId))) && !refused.admits(utx.transaction, boxOf)
+      }
+      unsponsored.foldLeft(withRefused) { case (mp, utx) => mp.invalidate(utx) }
+    }
+  }
+
+  /**
+    * YOLO switch on: drops the refusal of `spentBoxIds` (boxes spent in applied blocks), then ages the set at `height`
+    * (`YoloRefusedBoxes.aged`: old entries dropped when their box is not in the UTXO set, re-stamped when it is)
+    */
+  def yoloReleaseRefused(spentBoxIds: Seq[ModifierId], height: Int, inUtxoSet: ModifierId => Boolean): ErgoMemPool = {
+    if (yoloRefused.isEmpty) {
+      this
+    } else {
+      val released = yoloRefused.removed(spentBoxIds)
+      val after = released.aged(height, inUtxoSet)
+      if ((after eq released) && after.size == yoloRefused.size) this else new ErgoMemPool(pool, stats, sortingOption, after)
+    }
+  }
+
+  /** The same pool with `refused` as its refused boxes (YOLO switch on; the node view holder loads them at start) */
+  def withYoloRefused(refused: YoloRefusedBoxes): ErgoMemPool = new ErgoMemPool(pool, stats, sortingOption, refused)
 
   /**
     * Check if transaction was invalidated earlier
@@ -227,7 +269,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
       if (ownWtx.weight > doubleSpendingTotalWeight) {
         val doubleSpendingTxs = doubleSpendingWtxs.map(wtx => pool.orderedTransactions(wtx)).toSeq
         val p = pool.remove(doubleSpendingTxs).put(unconfirmedTransaction, feeF)
-        val updPool = new ErgoMemPool(p, stats, sortingOption)
+        val updPool = new ErgoMemPool(p, stats, sortingOption, yoloRefused)
         updPool -> new ProcessingOutcome.Accepted(unconfirmedTransaction, validationStartTime)
       } else {
         this -> new ProcessingOutcome.DoubleSpendingLoser(doubleSpendingWtxs.map(_.id), validationStartTime)
@@ -239,7 +281,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
         val exc = new Exception("Transaction pays less than any other in the pool being full")
         this -> new ProcessingOutcome.Declined(exc, validationStartTime)
       } else {
-        val updPool = new ErgoMemPool(pool.put(unconfirmedTransaction, feeF), stats, sortingOption)
+        val updPool = new ErgoMemPool(pool.put(unconfirmedTransaction, feeF), stats, sortingOption, yoloRefused)
         updPool -> new ProcessingOutcome.Accepted(unconfirmedTransaction, validationStartTime)
       }
     }
@@ -309,6 +351,19 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
               val resolvedInputs = tx.inputIds.map(utxoWithPool.boxById)
               if (resolvedInputs.forall(_.isDefined)) {
 
+                // YOLO switch on: the sponsor rule for refused boxes (YoloRefusedBoxes), before any script runs. A
+                // decline, not a validation failure: no peer is penalised, and the id is not cached, as the box stops
+                // being refused once it is spent on chain
+                if (yoloOn && !yoloRefused.admits(tx, utxoWithPool.boxById)) {
+                  val refusedIds = yoloRefused.refusedInputsOf(tx)
+                  log.info(s"Mempool declining transaction ${tx.id}: it spends refused boxes $refusedIds without a sponsor")
+                  val exc = new YoloRefusedBoxes.Refusal(s"Mempool policy declines transaction ${tx.id}: it spends " +
+                    s"${refusedIds.size} box(es) refused after a transaction spending them failed or went over its " +
+                    "recorded cost at block assembly; add an input of your own, a plain key-signed box (P2PK " +
+                    "with its signature), to spend them")
+                  return (this, new ProcessingOutcome.Declined(exc, validationStartTime))
+                }
+
                 if (outputsContainReemissionToken(tx.outputCandidates, utxo.stateContext)) {
                   log.info(s"Mempool rejecting transaction with reemission token: ${tx.id}")
                   val exc = new Exception(
@@ -316,7 +371,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                   // The pool is rebuilt directly, rather than via `this.invalidate`, because that
                   // helper runs `updateStatsOnRemoval`, which resets statistics for a transaction
                   // that was never in the pool - which is exactly the case here.
-                  return (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption),
+                  return (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption, yoloRefused),
                     new ProcessingOutcome.Declined(exc, validationStartTime))
                 }
 
@@ -326,7 +381,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                     "Mempool policy declines a storage rent collection transaction")
                   // Rebuilt directly, rather than via `this.invalidate`, for the same reason
                   // as the re-emission prefilter above.
-                  return (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption),
+                  return (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption, yoloRefused),
                     new ProcessingOutcome.Declined(exc, validationStartTime))
                 }
 
@@ -346,13 +401,17 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                 // with the YOLO switch on, also the fee output policy (YoloFeeOutputPolicy); with it off, exactly
                 // utxoWithPool.validateWithCost(tx, validationContext, costLimit, None)
                 YoloFeeOutputPolicy.validateWithCost(utxoWithPool, tx, validationContext, costLimit) match {
+                  case Success(cost) if yoloOn =>
+                    // YOLO: the cost is recorded with its record key (YoloAssemblyPolicy.costKey)
+                    val key = YoloAssemblyPolicy.costKey(validationContext.currentParameters)
+                    acceptIfNoDoubleSpend(unconfirmedTx.withRecordedCost(cost, key), validationStartTime)
                   case Success(cost) =>
                     acceptIfNoDoubleSpend(unconfirmedTx.withCost(cost), validationStartTime)
                   case Failure(refusal: YoloFeeOutputPolicy.Refusal) =>
                     log.info(s"Mempool rejecting transaction ${tx.id}: ${refusal.getMessage}")
                     // a policy decline, not a validation failure (no peer is penalised); the id is cached as
                     // invalidated, as for the re-emission prefilter above, so the transaction is not processed again
-                    (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption),
+                    (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption, yoloRefused),
                       new ProcessingOutcome.Declined(refusal, validationStartTime))
                   case Failure(ex) =>
                     this.invalidate(unconfirmedTx) -> new ProcessingOutcome.Invalidated(ex, validationStartTime)
@@ -369,7 +428,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
               YoloFeeOutputPolicy.checkTokens(tx, state.stateContext.chainSettings) match {
                 case Failure(refusal) =>
                   log.info(s"Mempool rejecting transaction ${tx.id}: ${refusal.getMessage}")
-                  (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption),
+                  (new ErgoMemPool(pool.invalidate(unconfirmedTx), stats, sortingOption, yoloRefused),
                     new ProcessingOutcome.Declined(refusal, validationStartTime))
                 case Success(_) =>
                   acceptIfNoDoubleSpend(unconfirmedTx, validationStartTime)

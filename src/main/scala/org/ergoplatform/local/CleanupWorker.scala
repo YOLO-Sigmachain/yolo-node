@@ -3,6 +3,7 @@ package org.ergoplatform.local
 import akka.actor.{Actor, ActorRef}
 import org.ergoplatform.local.CleanupWorker.RunCleanup
 import org.ergoplatform.local.MempoolAuditor.CleanupDone
+import org.ergoplatform.mining.YoloAssemblyPolicy
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.mempool.{ErgoMemPoolReader, YoloFeeOutputPolicy}
 import org.ergoplatform.nodeView.state.{ErgoStateContext, UtxoStateReader}
@@ -89,7 +90,12 @@ class CleanupWorker(nodeViewHolderRef: ActorRef,
           val validationContext = state.stateContext.simplifiedUpcoming()
           CleanupWorker.revalidate(state, head.transaction, validationContext, nodeSettings.maxTransactionCost) match {
             case Success(txCost) =>
-              val updTx = head.withCost(txCost)
+              // YOLO switch on: recorded with its record key, never lower than the record under the same key
+              val updTx = if (validationContext.chainSettings.yolo.enabled) {
+                head.withRecordedCost(txCost, YoloAssemblyPolicy.costKey(validationContext.currentParameters))
+              } else {
+                head.withCost(txCost)
+              }
               validationLoop(tail, validated += updTx, invalidated, txCost + costAcc)
             case Failure(e) =>
               val txId = head.id

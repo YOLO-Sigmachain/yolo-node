@@ -3,6 +3,7 @@ package org.ergoplatform.nodeView
 import akka.actor.SupervisorStrategy.Escalate
 import akka.actor.{Actor, ActorRef, ActorSystem, OneForOneStrategy, Props}
 import org.ergoplatform.{CriticalSystemException, ErgoApp}
+import org.ergoplatform.ErgoBox
 import org.ergoplatform.consensus.ProgressInfo
 import org.ergoplatform.core._
 import org.ergoplatform.modifiers.history.header.Header
@@ -14,7 +15,7 @@ import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.{BlockAppliedTransactions, CurrentView, DownloadRequest}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages._
 import org.ergoplatform.nodeView.history.ErgoHistory
-import org.ergoplatform.nodeView.mempool.ErgoMemPool
+import org.ergoplatform.nodeView.mempool.{ErgoMemPool, YoloRefusedBoxesStore}
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils.ProcessingOutcome
 import org.ergoplatform.nodeView.state._
 import org.ergoplatform.nodeView.wallet.ErgoWallet
@@ -22,7 +23,8 @@ import org.ergoplatform.settings.{Algos, Constants, ErgoSettings, NetworkType, S
 import org.ergoplatform.utils.ScorexEncoding
 import org.ergoplatform.validation.{MalformedModifierError, RecoverableModifierError}
 import org.ergoplatform.wallet.utils.FileUtils
-import scorex.util.{ModifierId, ScorexLogging}
+import scorex.crypto.authds.ADKey
+import scorex.util.{ModifierId, ScorexLogging, bytesToId, idToBytes}
 import spire.syntax.all.cfor
 
 import java.io.File
@@ -92,6 +94,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     log.warn("Stopping ErgoNodeViewHolder")
     history().closeStorage()
     minimalState().closeStorage()
+    if (yoloOn) yoloRefusedStore.foreach(_.close())
   }
 
   /**
@@ -432,7 +435,53 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       .flatMap(extractTransactions)
       .filter(tx => !appliedTxs.exists(_.id == tx.id))
       .map(tx => UnconfirmedTransaction(tx, None))
-    memPool.removeWithDoubleSpends(appliedTxs).putRolledBack(rolledBackTxs)
+    val updated = memPool.removeWithDoubleSpends(appliedTxs).putRolledBack(rolledBackTxs)
+    if (yoloOn) {
+      // YOLO: a refused box leaves the refused set once spent in an applied block, or, when not in the UTXO set,
+      // after YoloRefusedBoxes.AgeLimit blocks
+      val spent = appliedTxs.flatMap(_.inputs.map(i => bytesToId(i.boxId)))
+      val height = blocksApplied.collect { case b: ErgoFullBlock => b.header.height }.reduceOption(_ max _)
+        .getOrElse(history().fullBlockHeight)
+      val inUtxoSet: ModifierId => Boolean = minimalState() match {
+        case utxo: UtxoStateReader => id => utxo.boxById(ADKey @@ idToBytes(id)).isDefined
+        case _ => _ => true
+      }
+      yoloStoreRefused(updated, updated.yoloReleaseRefused(spent, height, inUtxoSet))
+    } else {
+      updated
+    }
+  }
+
+  private def yoloOn: Boolean = settings.chainSettings.yolo.enabled
+
+  /**
+    * YOLO switch on: disk store of the mempool's refused boxes, opened on first use; None with the switch
+    * off, or when it cannot be opened (the set is then kept in memory only)
+    */
+  private lazy val yoloRefusedStore: Option[YoloRefusedBoxesStore] =
+    if (yoloOn) YoloRefusedBoxesStore.open(s"${settings.directory}/yolo-refused-boxes") else None
+
+  /** `after`, with its refused boxes' change from `before` written to the disk store */
+  private def yoloStoreRefused(before: ErgoMemPool, after: ErgoMemPool): ErgoMemPool = {
+    yoloRefusedStore.foreach(_.update(before.yoloRefused, after.yoloRefused))
+    after
+  }
+
+  /**
+    * YOLO switch on: box lookup for the sponsor rule (`YoloRefusedBoxes.admits`), from the UTXO set and the outputs
+    * of `poolTxs`; it resolves nothing without a UTXO set, so no input is then a sponsor
+    */
+  private def yoloBoxOf(poolTxs: => Seq[UnconfirmedTransaction]): ADKey => Option[ErgoBox] = minimalState() match {
+    case utxo: UtxoStateReader =>
+      lazy val withPool = utxo.withUnconfirmedTransactions(poolTxs)
+      id => withPool.boxById(id)
+    case _ => _ => None
+  }
+
+  /** An empty mempool; with the YOLO switch on, holding the refused boxes kept on disk */
+  private def emptyMemPool(): ErgoMemPool = {
+    val pool = ErgoMemPool.empty(settings)
+    yoloRefusedStore.map(store => pool.withYoloRefused(store.load())).getOrElse(pool)
   }
 
   /**
@@ -446,7 +495,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
     val wallet = ErgoWallet.readOrGenerate(history.getReader, settings, settings.launchParameters)
 
-    val memPool = ErgoMemPool.empty(settings)
+    val memPool = emptyMemPool()
 
     (history, state, wallet, memPool)
   }
@@ -461,7 +510,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
   } else {
     val history = ErgoHistory.readOrGenerate(settings)
     log.info("History database read")
-    val memPool = ErgoMemPool.empty(settings)
+    val memPool = emptyMemPool()
     restoreConsistentState(ErgoState.readOrGenerate(settings).asInstanceOf[State], history) match {
       case Success(state) =>
         log.info(s"State database read, state synchronized")
@@ -697,10 +746,26 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     case LocallyGeneratedTransaction(unconfirmedTx) =>
       sender() ! txModify(unconfirmedTx)
     case RecheckedTransactions(unconfirmedTxs) =>
-      val updatedPool = memoryPool().put(unconfirmedTxs)
+      // YOLO switch on: a transaction the cleanup re-checked from its snapshot is not put back if it spends a box
+      // refused meanwhile without a sponsor (YoloRefusedBoxes); with the switch off the refused set is empty
+      val toPut = if (yoloOn) {
+        val boxOf = yoloBoxOf(memoryPool().getAll ++ unconfirmedTxs)
+        unconfirmedTxs.filter(utx => memoryPool().yoloRefused.admits(utx.transaction, boxOf))
+      } else {
+        unconfirmedTxs
+      }
+      val updatedPool = memoryPool().put(toPut)
       updateNodeView(updatedMempool = Some(updatedPool))
-    case EliminateTransactions(ids) =>
-      val updatedPool = ids.foldLeft(memoryPool()) { case (pool, txId) => pool.invalidate(txId) }
+    case EliminateTransactions(ids, refusedBoxIds) =>
+      val invalidated = ids.foldLeft(memoryPool()) { case (pool, txId) => pool.invalidate(txId) }
+      // YOLO switch on: block assembly caught these transactions as cost liars or failures; refuse their inputs
+      // (always empty with the switch off)
+      val updatedPool = if (refusedBoxIds.nonEmpty) {
+        yoloStoreRefused(invalidated, invalidated.yoloRefuse(refusedBoxIds, history().fullBlockHeight,
+          yoloBoxOf(invalidated.getAll)))
+      } else {
+        invalidated
+      }
       updateNodeView(updatedMempool = Some(updatedPool))
       val e = new Exception("Became invalid")
       ids.foreach { id =>
@@ -800,7 +865,11 @@ object ErgoNodeViewHolder {
       */
     case class RecheckedTransactions(unconfirmedTxs: Iterable[UnconfirmedTransaction])
 
-    case class EliminateTransactions(ids: Seq[ModifierId])
+    /**
+      * Evict the transactions `ids` from the mempool, caching their ids. With the YOLO switch on, block assembly also
+      * gives `refusedBoxIds`, the inputs to refuse at admission (`YoloRefusedBoxes`); always empty with it off.
+      */
+    case class EliminateTransactions(ids: Seq[ModifierId], refusedBoxIds: Seq[ModifierId] = Seq.empty)
 
     case object IsChainHealthy
     sealed trait HealthCheckResult

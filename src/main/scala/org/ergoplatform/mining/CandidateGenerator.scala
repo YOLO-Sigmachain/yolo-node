@@ -59,6 +59,9 @@ class CandidateGenerator(
   private val candidateGenInterval =
     ergoSettings.nodeSettings.blockCandidateGenerationInterval
 
+  /** YOLO switch on only: assembly records and own evictions kept between candidates */
+  private val yoloMemory = new YoloAssemblyMemory
+
   /** retrieve Readers once on start and then get updated by events */
   override def preStart(): Unit = {
     log.info("CandidateGenerator is starting")
@@ -211,7 +214,8 @@ class CandidateGenerator(
           effectiveMinerPk,
           txsToInclude,
           state.lastAppliedBlockTxs,
-          ergoSettings
+          ergoSettings,
+          yoloMemory
         ) match {
           case Some(Failure(ex)) =>
             log.error(s"Candidate generation failed", ex)
@@ -531,7 +535,8 @@ object CandidateGenerator extends ScorexLogging {
     pk: ProveDlog,
     txsToInclude: Seq[ErgoTransaction],
     lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])],
-    ergoSettings: ErgoSettings
+    ergoSettings: ErgoSettings,
+    yoloMemory: YoloAssemblyMemory = new YoloAssemblyMemory
   ): Option[Try[(Candidate, EliminateTransactions)]] = {
     // mandatory transactions to include into next block taken from the previous candidate
     val stateWithMandatoryTxs = s.withTransactions(txsToInclude)
@@ -581,7 +586,8 @@ object CandidateGenerator extends ScorexLogging {
         poolTransactions,
         emissionTxOpt,
         unspentTxsToInclude,
-        ergoSettings
+        ergoSettings,
+        yoloMemory
       )
       if (!chainSynced) {
         log.debug(
@@ -658,6 +664,8 @@ object CandidateGenerator extends ScorexLogging {
     * @param emissionTxOpt           - optional emission transaction
     * @param prioritizedTransactions - transactions which are going into the block in the first place
     *                                (before transactions from the pool). No guarantee of inclusion in general case.
+    * @param yoloMemory              - YOLO switch on only: what the generator remembers between candidates
+    *                                (`YoloAssemblyMemory`); unused with the switch off
     * @return - candidate or an error
     */
   def createCandidate(
@@ -668,7 +676,8 @@ object CandidateGenerator extends ScorexLogging {
                        poolTxs: Seq[UnconfirmedTransaction],
                        emissionTxOpt: Option[ErgoTransaction],
                        prioritizedTransactions: Seq[ErgoTransaction],
-                       ergoSettings: ErgoSettings
+                       ergoSettings: ErgoSettings,
+                       yoloMemory: YoloAssemblyMemory = new YoloAssemblyMemory
   ): Try[(Candidate, EliminateTransactions)] =
     Try {
       val popowAlgos = new NipopowAlgos(ergoSettings.chainSettings)
@@ -792,8 +801,10 @@ object CandidateGenerator extends ScorexLogging {
               b => permanentlySkipped += bytesToId(b.id),
               // YOLO: the claim's cost is kept within YoloRentClaimCostBudget, so that it always fits beside the
               // emission and fee transactions in the reserve; boxes left out for the budget stay in the index. The
-              // bound counts what each recreated box locked by the fee proposition adds to the fee transaction
+              // bound counts what each recreated box locked by the fee proposition adds to the fee transaction, and
+              // the claim's size is kept within YoloAssemblyPolicy.RentClaimSizeBudget
               maxCost = if (ergoSettings.chainSettings.yolo.enabled) Some(YoloRentClaimCostBudget.toLong) else None,
+              maxSize = if (ergoSettings.chainSettings.yolo.enabled) Some(YoloAssemblyPolicy.RentClaimSizeBudget.toLong) else None,
               outputCostBound = (o: ErgoBoxCandidate) =>
                 if (ergoSettings.chainSettings.yolo.enabled) yoloFeeOutputCost(params, ergoSettings.chainSettings)(o) else 0L
             ).toSeq
@@ -827,21 +838,77 @@ object CandidateGenerator extends ScorexLogging {
         }
       }
 
+      // With the YOLO switch on, the candidate's transactions are chosen by YoloAssemblyPolicy.collect: each pool
+      // transaction is held to the cost this node recorded for it, a valid one that does not fit is passed over at
+      // zero work (it never ends assembly), one that goes over its abort limit or fails is evicted and its inputs are
+      // refused, and the work on transactions left out is capped per candidate. The emission and prioritized
+      // transactions are validated as upstream and end assembly if they do not fit; the miner's own rent claim is
+      // left out if it does not fit, without being reported invalid (so its boxes stay in the rent index). A pass
+      // that ran short of its work budget and evicted a transaction is followed at once by another one, which does
+      // not look at the evicted transactions again, at most YoloAssemblyPolicy.MaxZPassesPerParent per parent.
+      // With the switch off, collectTxs runs exactly as upstream.
+      def yoloCollect(): (Seq[ErgoTransaction], Seq[ModifierId], Seq[ModifierId]) = {
+        val params = upcomingContext.currentParameters
+        val key = YoloAssemblyPolicy.costKey(params)
+        yoloMemory.forParent(bestHeaderOpt.map(_.id))
+        val poolIds = poolTxs.map(_.id).toSet
+        val invalid = mutable.LinkedHashSet.empty[ModifierId]
+        val refused = mutable.LinkedHashSet.empty[ModifierId]
+        @tailrec
+        def pass(): Seq[ErgoTransaction] = {
+          // r(t): the larger of the pool's record and this generator's, under the current key
+          val pool = poolTxs.map { utx =>
+            val record = (utx.recordedCost(key).toSeq ++ yoloMemory.record(utx.id, key).toSeq).reduceOption(_ max _)
+            YoloAssemblyPolicy.PoolTx(utx.transaction, record)
+          }
+          val res = YoloAssemblyPolicy.collect(minerPk, state, upcomingContext, YoloAssemblyPolicy.budget(params),
+            YoloAssemblyPolicy.relayLimitInUse(ergoSettings.nodeSettings.maxTransactionCost, params),
+            emissionTxs ++ prioritizedTransactions ++ rentClaimTxs, rentClaimTxs.map(_.id).toSet, pool,
+            yoloMemory.evictedForParent)
+          yoloMemory.notePass()
+          res.records.foreach { case (id, cost) => yoloMemory.keep(id, cost, key) }
+          yoloMemory.noteEvicted(res.invalid.filter(poolIds.contains))
+          invalid ++= res.invalid
+          refused ++= res.refusedBoxIds
+          if (res.passedOverForZ && res.evicted) {
+            yoloMemory.noteZPass()
+            if (yoloMemory.zPassesForParent < YoloAssemblyPolicy.MaxZPassesPerParent) {
+              log.info(s"YOLO assembly ran short of its work budget and evicted transactions, assembling again " +
+                s"(pass ${yoloMemory.zPassesForParent + 1} for this parent)")
+              pass()
+            } else {
+              res.txs
+            }
+          } else {
+            res.txs
+          }
+        }
+        val txs = pass()
+        yoloMemory.prune(poolIds)
+        (txs, invalid.toSeq, refused.toSeq)
+      }
+
       // A storage-rent claim rejected during candidate assembly gets its input boxes dropped
       // from the storage-rent index, so a broken eligibility entry is not retried in every
       // candidate. Removal is idempotent, so a claim re-rejected by the retry pass below is
-      // handled by the same code without any extra bookkeeping.
+      // handled by the same code without any extra bookkeeping. A claim left out because it does
+      // not fit (YOLO) is not in the rejected list, so its boxes stay.
       // With the YOLO switch on, only the boxes `yoloRejectedClaimEviction` names are dropped: none when the claim
       // lost a race (an input already spent), else the boxes that fail on their own.
-      def collectPoolTxs: (Seq[ErgoTransaction], Seq[ModifierId]) = {
-        val res = collectTxs(
-          minerPk,
-          state.stateContext.currentParameters.maxBlockCost - safeGap,
-          state.stateContext.currentParameters.maxBlockSize,
-          state,
-          upcomingContext,
-          emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
-        )
+      def collectPoolTxs: (Seq[ErgoTransaction], Seq[ModifierId], Seq[ModifierId]) = {
+        val res = if (ergoSettings.chainSettings.yolo.enabled) {
+          yoloCollect()
+        } else {
+          val (collected, invalid) = collectTxs(
+            minerPk,
+            state.stateContext.currentParameters.maxBlockCost - safeGap,
+            state.stateContext.currentParameters.maxBlockSize,
+            state,
+            upcomingContext,
+            emissionTxs ++ prioritizedTransactions ++ rentClaimTxs ++ poolTxs.map(_.transaction)
+          )
+          (collected, invalid, Seq.empty[ModifierId])
+        }
         if (ergoSettings.chainSettings.yolo.enabled) {
           // YOLO: a block without the coinbase pays no emission; say why, loudly
           emissionTxOpt.filterNot(etx => res._1.exists(_.id == etx.id)).foreach { etx =>
@@ -879,9 +946,9 @@ object CandidateGenerator extends ScorexLogging {
         res
       }
 
-      val (txs, toEliminate) = collectPoolTxs
+      val (txs, toEliminate, toRefuse) = collectPoolTxs
 
-      val eliminateTransactions = EliminateTransactions(toEliminate)
+      val eliminateTransactions = EliminateTransactions(toEliminate, toRefuse)
 
       if (txs.isEmpty) {
         throw new IllegalArgumentException(
@@ -924,11 +991,11 @@ object CandidateGenerator extends ScorexLogging {
           // A likely reason of the failure is a state update (new block applied) between
           // collectTxs and proofsForTransactions. Re-collect transactions against the current
           // state and retry once before falling back to an emission-only candidate.
-          val (retryTxs, retryToEliminate) = collectPoolTxs
+          val (retryTxs, retryToEliminate, retryToRefuse) = collectPoolTxs
           // The first pass may have rejected transactions against a transient state.
           // Keep only the classifications from the latest collection attempt.
           log.error("Retrying candidate generation after failed proofs")
-          val retryEliminate = EliminateTransactions(retryToEliminate)
+          val retryEliminate = EliminateTransactions(retryToEliminate, retryToRefuse)
           state.proofsForTransactions(retryTxs) match {
             case Success((adProof, adDigest)) =>
               log.warn(

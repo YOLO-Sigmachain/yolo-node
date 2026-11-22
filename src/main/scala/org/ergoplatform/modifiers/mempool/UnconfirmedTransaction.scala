@@ -12,13 +12,16 @@ import scorex.util.{ModifierId, ScorexLogging}
   * @param lastCheckedTime - when last validity check was done
   * @param transactionBytes - transaction bytes, to avoid serializations when we send it over the wire
   * @param source - peer which delivered the transaction (None if transaction submitted via API)
+  * @param costKey - YOLO switch on only: record key of `lastCost` (`YoloAssemblyPolicy.costKey` of the parameters it
+  *                was measured under); None when not known, and always None with the switch off
   */
 class UnconfirmedTransaction(val transaction: ErgoTransaction,
                              val lastCost: Option[Int],
                              val createdTime: Long,
                              val lastCheckedTime: Long,
                              val transactionBytes: Option[Array[Byte]],
-                             val source: Option[ConnectedPeer])
+                             val source: Option[ConnectedPeer],
+                             val costKey: Option[Int] = None)
   extends ScorexLogging {
 
   def id: ModifierId = transaction.id
@@ -35,6 +38,25 @@ class UnconfirmedTransaction(val transaction: ErgoTransaction,
       transactionBytes,
       source)
   }
+
+  /**
+    * YOLO switch on: records `cost`, measured under record key `key`. Under the same key as the cost recorded so far,
+    * the larger of the two is kept (a record never goes down); under another key, or with none recorded, `cost`.
+    */
+  def withRecordedCost(cost: Int, key: Int): UnconfirmedTransaction = {
+    val recorded = if (costKey.contains(key)) lastCost.fold(cost)(math.max(_, cost)) else cost
+    new UnconfirmedTransaction(
+      transaction,
+      lastCost = Some(recorded),
+      createdTime,
+      lastCheckedTime = System.currentTimeMillis(),
+      transactionBytes,
+      source,
+      costKey = Some(key))
+  }
+
+  /** The recorded cost, if it was measured under record key `key` */
+  def recordedCost(key: Int): Option[Int] = if (costKey.contains(key)) lastCost else None
 
   override def equals(obj: Any): Boolean = obj match {
     case that: UnconfirmedTransaction => that.id == id
