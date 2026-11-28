@@ -134,7 +134,7 @@ class YoloSettingsSpec extends ErgoCorePropertyTest {
     val on = chainSettings.copy(yolo = YoloSettings(enabled = true,
       emission = YoloEmissionSettings(genesisValue = 177291450000000000L)))
     on.yoloEmissionRulesOpt.map(_.genesisValue) shouldBe Some(177291450000000000L)
-    on.yoloEmissionRulesOpt.map(_.terminalHeight) shouldBe Some(21024049L)
+    on.yoloEmissionRulesOpt.map(_.terminalHeight) shouldBe Some(26258983L)
     // the Ergo rules stay as they are
     on.emissionRules.minersCoinsTotal shouldBe chainSettings.emissionRules.minersCoinsTotal
   }

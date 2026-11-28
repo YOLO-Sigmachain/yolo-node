@@ -64,15 +64,15 @@ class YoloEmissionTrackingSpec extends ErgoCorePropertyTest with TestFileUtils {
 
   private lazy val regs: ErgoBox.AdditionalRegisters =
     Map(R4 -> emissionBox.additionalRegisters(R4), R5 -> emissionBox.additionalRegisters(R5))
-  private val Reward = 75000000000L
+  private val Reward = 37500000000L
 
   // a normal-path coinbase layout (scripts are not run by extractEmissionBox)
   private def successor(value: Long, tokens: Seq[(ErgoBox.TokenId, Long)]): ErgoBoxCandidate =
     candidate(value, e.emissionTree, tokens, regs)
   private def shares: Seq[ErgoBoxCandidate] = Seq(
-    candidate(3000000000L, e.treasuryAccumulationTree),
-    candidate(2250000000L, e.lpAccumulationTree),
-    candidate(69750000000L, TrueTree))
+    candidate(1500000000L, e.treasuryAccumulationTree),
+    candidate(1125000000L, e.lpAccumulationTree),
+    candidate(34875000000L, TrueTree))
 
   private def otherTx: ErgoTransaction = spend(Seq(boxes(3)), candidate(1000000000L, TrueTree))
 
@@ -110,14 +110,14 @@ class YoloEmissionTrackingSpec extends ErgoCorePropertyTest with TestFileUtils {
   }
 
   property("terminal spend (NFT burned, no output at the emission tree): tracking returns None") {
-    val last = ErgoState.createGenesisBox(1500000000L, e.emissionTree, Seq(token(e.emissionNftIdBytes)), regs)
+    val last = ErgoState.createGenesisBox(1562500000L, e.emissionTree, Seq(token(e.emissionNftIdBytes)), regs)
     val genesis = last +: boxes.tail
     val us = state(devnet, genesis, Some(last))
     us.emissionBoxOpt shouldBe Some(last)
     val terminal = spend(Seq(last),
-      candidate(60000000L, e.treasuryAccumulationTree),
-      candidate(45000000L, e.lpAccumulationTree),
-      candidate(1395000000L, TrueTree))
+      candidate(62500000L, e.treasuryAccumulationTree),
+      candidate(46875000L, e.lpAccumulationTree),
+      candidate(1453125000L, TrueTree))
     us.extractEmissionBox(block(terminal)) shouldBe None
     us.closeStorage()
   }
@@ -133,8 +133,8 @@ class YoloEmissionTrackingSpec extends ErgoCorePropertyTest with TestFileUtils {
     // the NFT at another script is not found
     found(Seq(token(e.emissionNftIdBytes)), 177291450000000000L, TrueTree) shouldBe None
     // the real box is found even below Ergo's 100,000-coin spam filter (the last YOLO blocks)
-    val small = found(Seq(token(e.emissionNftIdBytes)), 1500000000L)
-    small.map(_.value) shouldBe Some(1500000000L)
+    val small = found(Seq(token(e.emissionNftIdBytes)), 1562500000L)
+    small.map(_.value) shouldBe Some(1562500000L)
     small.exists(e.isEmissionBox) shouldBe true
     found(Seq(token(e.emissionNftIdBytes)), 99999L * EmissionRules.CoinsInOneErgo).map(_.value) shouldBe
       Some(99999L * EmissionRules.CoinsInOneErgo)
@@ -154,10 +154,10 @@ class YoloEmissionTrackingSpec extends ErgoCorePropertyTest with TestFileUtils {
   }
 
   property("across the terminal block (applyModifier): the stored empty id reads as no emission box, also reopened") {
-    // 235 YOLO: heights 1 to 3 pay 75 YOLO each, height 4 is the terminal spend of the last 10 YOLO; height 5 is
+    // 122.5 YOLO: heights 1 to 3 pay 37.5 YOLO each, height 4 is the terminal spend of the last 10 YOLO; height 5 is
     // after it, paid by a spendable genesis box
     val s = devnet.copy(chainSettings = devnet.chainSettings.copy(yolo = devnet.chainSettings.yolo.copy(
-      emission = e.copy(genesisValue = 235L * YoloEmissionRules.CoinsInOneYolo))))
+      emission = e.copy(genesisValue = 1225L * YoloEmissionRules.CoinsInOneYolo / 10))))
     s.chainSettings.yoloEmissionRulesOpt.get.terminalHeight shouldBe 4L
     val spendable = new ErgoBoxCandidate(10000000000L, TrueTree, 0).toBox(bytesToId(Array.fill(32)(9: Byte)), 0)
     val genesis = ErgoState.genesisBoxes(s.chainSettings) :+ spendable

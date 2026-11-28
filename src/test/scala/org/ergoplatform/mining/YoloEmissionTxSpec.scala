@@ -175,8 +175,8 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
     us0.stateContext.currentHeight shouldBe 0
 
     val tx = CandidateGenerator.collectEmission(us0, defaultMinerPk, us0.stateContext).get
-    checkNormalLayout(tx, genesisBox, 1, defaultMinerPk, 3000000000L, 2250000000L, 69750000000L)
-    tx.outputs.head.value shouldBe GenesisValue - 75L * Coin
+    checkNormalLayout(tx, genesisBox, 1, defaultMinerPk, 1500000000L, 1125000000L, 34875000000L)
+    tx.outputs.head.value shouldBe GenesisValue - 37500000000L
 
     val ctx = upcoming(us0.stateContext, defaultMinerPk)
     ctx.currentHeight shouldBe 1
@@ -212,10 +212,10 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
     var parent: Option[ErgoFullBlock] = None
     (1 to 4).foreach { h =>
       val before = us.emissionBoxOpt.get
-      before.value shouldBe GenesisValue - 75L * Coin * (h - 1)
+      before.value shouldBe GenesisValue - 37500000000L * (h - 1)
       before.creationHeight shouldBe h - 1
       val tx = CandidateGenerator.collectEmission(us, defaultMinerPk, us.stateContext).get
-      checkNormalLayout(tx, before, h, defaultMinerPk, 3000000000L, 2250000000L, 69750000000L)
+      checkNormalLayout(tx, before, h, defaultMinerPk, 1500000000L, 1125000000L, 34875000000L)
       validate(us, tx, upcoming(us.stateContext, defaultMinerPk)) shouldBe 'success
       val (next, fb) = mine(us, parent, Seq(tx))
       fb.header.height shouldBe h
@@ -223,21 +223,22 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
       us = next
       parent = Some(fb)
     }
-    us.emissionBoxOpt.get.value shouldBe GenesisValue - 4 * 75L * Coin
+    us.emissionBoxOpt.get.value shouldBe GenesisValue - 4 * 37500000000L
     us.closeStorage()
   }
 
-  property("halving boundaries 1,051,199 / 1,051,200 and 2,102,399 / 2,102,400, and the floor start 6,307,200: " +
-    "valid, right amounts") {
+  property("halving boundaries 1,051,199 / 1,051,200 and 2,102,399 / 2,102,400, and the tail start 3,153,599 / " +
+    "3,153,600: valid, right amounts") {
     // the emission box "at" height h is built directly (value boxValueAt(h), creation height h - 1) and put into a
     // genesis-like state; the validation context has a generated last header at h - 1
     val rules = devnet.chainSettings.yoloEmissionRulesOpt.get
     val cases = Seq(
-      (1051199, 3000000000L, 2250000000L, 69750000000L),
-      (1051200, 1500000000L, 1125000000L, 34875000000L),
-      (2102399, 1500000000L, 1125000000L, 34875000000L),
-      (2102400, 750000000L, 562500000L, 17437500000L),
-      (6307200, 60000000L, 45000000L, 1395000000L))
+      (1051199, 1500000000L, 1125000000L, 34875000000L),
+      (1051200, 750000000L, 562500000L, 17437500000L),
+      (2102399, 750000000L, 562500000L, 17437500000L),
+      (2102400, 375000000L, 281250000L, 8718750000L),
+      (3153599, 375000000L, 281250000L, 8718750000L),
+      (3153600, 187500000L, 140625000L, 4359375000L))
     cases.foreach { case (h, treasury, lp, miner) =>
       withClue(s"height $h: ") {
         val genesis = ErgoState.genesisBoxes(devnet.chainSettings)
@@ -267,8 +268,8 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
   }
 
   property("terminal path: small genesis value, 3 outputs, NFT burned, then no emission box and no emission tx") {
-    // 235 YOLO: heights 1 to 3 pay 75 each (normal), height 4 spends the last 10 YOLO (terminal)
-    val s = withGenesisValue(235L * Coin)
+    // 122.5 YOLO: heights 1 to 3 pay 37.5 each (normal), height 4 spends the last 10 YOLO (terminal)
+    val s = withGenesisValue(1225L * Coin / 10)
     s.chainSettings.yoloEmissionRulesOpt.get.terminalHeight shouldBe 4
     var us = genesisState(s)
     var parent: Option[ErgoFullBlock] = None
@@ -293,8 +294,8 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
   }
 
   property("terminal path at equality (box value == reward): the split of the box equals the normal split") {
-    // 150 YOLO: height 1 leaves exactly 75 YOLO, spent at height 2 on the terminal path
-    val s = withGenesisValue(150L * Coin)
+    // 75 YOLO: height 1 leaves exactly 37.5 YOLO, spent at height 2 on the terminal path
+    val s = withGenesisValue(75L * Coin)
     s.chainSettings.yoloEmissionRulesOpt.get.terminalHeight shouldBe 2
     val us0 = genesisState(s)
     val (us1, fb1) = mine(us0, None, CandidateGenerator.collectEmission(us0, defaultMinerPk, us0.stateContext).toSeq)
@@ -302,7 +303,7 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
     last.value shouldBe YoloEmissionRules.rewardAtHeight(2)
     YoloEmissionTx.isTerminal(last.value, 2) shouldBe true
     val tx = CandidateGenerator.collectEmission(us1, defaultMinerPk, us1.stateContext).get
-    checkTerminalLayout(tx, last, 2, defaultMinerPk, 3000000000L, 2250000000L, 69750000000L)
+    checkTerminalLayout(tx, last, 2, defaultMinerPk, 1500000000L, 1125000000L, 34875000000L)
     validate(us1, tx, upcoming(us1.stateContext, defaultMinerPk)) shouldBe 'success
     val (us2, _) = mine(us1, Some(fb1), Seq(tx))
     us2.emissionBoxOpt shouldBe None
@@ -376,39 +377,45 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
 
   private lazy val p2pk: ErgoTree = P2PKAddress(otherPk)(devnet.addressEncoder).script
 
-  property("devnet genesis: last normal spend at 21,023,915 from a 2.5 YOLO box, terminal spend at 21,023,916") {
+  property("devnet genesis: last normal spend at 26,258,940 from a 6.25 YOLO box, terminal spend at 26,258,941, " +
+    "no emission at 26,258,942") {
     val rules = devnet.chainSettings.yoloEmissionRulesOpt.get
     rules.genesisValue shouldBe GenesisValue
-    rules.terminalHeight shouldBe 21023916L
-    rules.boxValueAt(21023915L) shouldBe 2500000000L
+    rules.terminalHeight shouldBe 26258941L
+    rules.boxValueAt(26258940L) shouldBe 6250000000L
 
-    // the last normal spend: 1.5 YOLO paid, the successor holds the last 1.0 YOLO
-    val (us1, ctx1, tx1) = atTail(21023915, emissionInputAt(21023915, rules.boxValueAt(21023915L)))
-    checkNormalLayout(tx1, us1.emissionBoxOpt.get, 21023915, defaultMinerPk, 60000000L, 45000000L, 1395000000L)
-    tx1.outputs.head.value shouldBe 1000000000L
+    // the last normal spend: 4.6875 YOLO paid, the successor holds the last 1.5625 YOLO
+    val (us1, ctx1, tx1) = atTail(26258940, emissionInputAt(26258940, rules.boxValueAt(26258940L)))
+    checkNormalLayout(tx1, us1.emissionBoxOpt.get, 26258940, defaultMinerPk, 187500000L, 140625000L, 4359375000L)
+    tx1.outputs.head.value shouldBe 1562500000L
     validate(us1, tx1, ctx1) shouldBe 'success
     us1.closeStorage()
 
-    // the terminal spend of that successor: 1.0 YOLO split 4 / 3 / 93, NFT burned
+    // the terminal spend of that successor: 1.5625 YOLO split 4 / 3 / 93, NFT burned
     val last = tx1.outputs.head
-    rules.boxValueAt(21023916L) shouldBe last.value
-    val (us2, ctx2, tx2) = atTail(21023916, last)
-    checkTerminalLayout(tx2, last, 21023916, defaultMinerPk, 40000000L, 30000000L, 930000000L)
+    rules.boxValueAt(26258941L) shouldBe last.value
+    val (us2, ctx2, tx2) = atTail(26258941, last)
+    checkTerminalLayout(tx2, last, 26258941, defaultMinerPk, 62500000L, 46875000L, 1453125000L)
     validate(us2, tx2, ctx2) shouldBe 'success
+    // height 26,258,942: the box is gone, so there is no emission transaction
+    rules.boxValueAt(26258942L) shouldBe 0L
+    rules.isTerminalHeight(26258942L) shouldBe false
+    CandidateGenerator.collectRewards(None, 26258941, Seq.empty, defaultMinerPk,
+      atHeight(us2.stateContext, 26258941)) shouldBe empty
     us2.closeStorage()
   }
 
-  property("terminal path: an odd box value (1,000,000,007 nano) is split with the rounding to the miner") {
-    val input = emissionInputAt(21023916, 1000000007L)
-    val (us, ctx, tx) = atTail(21023916, input)
-    checkTerminalLayout(tx, input, 21023916, defaultMinerPk, 40000000L, 30000000L, 930000007L)
+  property("terminal path: an odd box value (1,562,500,007 nano) is split with the rounding to the miner") {
+    val input = emissionInputAt(26258941, 1562500007L)
+    val (us, ctx, tx) = atTail(26258941, input)
+    checkTerminalLayout(tx, input, 26258941, defaultMinerPk, 62500000L, 46875000L, 1453125007L)
     validate(us, tx, ctx) shouldBe 'success
     us.closeStorage()
   }
 
   property("terminal-path negative controls: each mutation is rejected by the emission script (rule 119)") {
-    val h = 21023916
-    val input = emissionInputAt(h, 1000000000L)
+    val h = 26258941
+    val input = emissionInputAt(h, 1562500000L)
     val (us, ctx, honest) = atTail(h, input)
     validate(us, honest, ctx) shouldBe 'success
     val IndexedSeq(t, l, m) = honest.outputCandidates
@@ -488,7 +495,7 @@ class YoloEmissionTxSpec extends ErgoCorePropertyTest with TestFileUtils {
     // generateCandidate passes the request's key to collectEmission and to the upcoming context
     val us0 = genesisState()
     val tx = CandidateGenerator.collectEmission(us0, otherPk, us0.stateContext).get
-    checkNormalLayout(tx, us0.emissionBoxOpt.get, 1, otherPk, 3000000000L, 2250000000L, 69750000000L)
+    checkNormalLayout(tx, us0.emissionBoxOpt.get, 1, otherPk, 1500000000L, 1125000000L, 34875000000L)
     val own = upcoming(us0.stateContext, otherPk)
     validate(us0, tx, own) shouldBe 'success
     rejectedByScript(us0, tx, upcoming(us0.stateContext, defaultMinerPk))

@@ -134,19 +134,17 @@ object YoloTreePins {
   def testSignerKeyIndices(pin: TreePin, tree: ErgoTree): Seq[Int] =
     pin.keyIndices.filter(i => isTestSignerKey(tree.constants(i)))
 
-  /** emission.es v1.4. */
-  val Emission: TreePin = TreePin("emission", 0x10, "e5be2df74d21a409b91cb9a3cc8b180234a37ffb0adb6acddb8773f0caf0d32f", IndexedSeq(
+  /** emission.es v1.5. */
+  val Emission: TreePin = TreePin("emission", 0x10, "267684693f111081f7735f667cf0f6d722ae14350b1c22e38d4f3a36bd4ff1aa", IndexedSeq(
     "", "0402", "0480a98001", "0400",
-    "0580b8c9e5ae04", "0402", "0580dce4b29702", "0404",
-    "0580aeb2d98b01", "0406", "058097d9ec45", "0408",
-    "05c0cbacf622", "040a", "05e0a596bb11", "0580bcc1960b",
-    "0580bcc1960b", "0580bcc1960b", "0400", "0508",
-    "05c801", "0400", "0402", "0506",
-    "05c801", "0508", "05c801", "0404",
-    "0506", "05c801", "0400", "0502",
-    "0e07100204802d08cd", "0e0eea02d192a39a8cc7a70173007301", "0400", "0402",
-    "0400", "0400", "0502", "0408",
-    "0406"),
+    "0580dce4b29702", "0402", "0580aeb2d98b01", "0404",
+    "058097d9ec45", "05c0cbacf622", "05c0cbacf622", "05c0cbacf622",
+    "0400", "0508", "05c801", "0400",
+    "0402", "0506", "05c801", "0508",
+    "05c801", "0404", "0506", "05c801",
+    "0400", "0502", "0e07100204802d08cd", "0e0eea02d192a39a8cc7a70173007301",
+    "0400", "0402", "0400", "0400",
+    "0502", "0408", "0406"),
     0, Seq())
 
   /** treasury_accumulation.es and lp_accumulation.es (one contract, shared by the treasury and LP roles). */

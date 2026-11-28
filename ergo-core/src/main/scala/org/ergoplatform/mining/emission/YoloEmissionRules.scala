@@ -16,14 +16,14 @@ case class YoloEmissionSplit(treasury: Long, lp: Long, miner: Long) {
 
 /**
   * YOLO (SigmaChain) emission curve and split, in integer nanocoin arithmetic exactly as the emission contract in
-  * the yolo-contracts repo (`01-emission-tests/emission.es` v1.4) computes them. Used in place of Ergo's `EmissionRules`
+  * the yolo-contracts repo (`01-emission-tests/emission.es` v1.5) computes them. Used in place of Ergo's `EmissionRules`
   * when `ergo.chain.yolo.enabled = true`; Ergo's rules in `ChainSettings.emissionRules` are left as they are.
   *
   * Curve: `halvings = height / BlocksPerHalving` (integer division, so height 1,051,200 is already in the second
-  * arm); 75 YOLO for halvings <= 0, then 37.5, 18.75, 9.375, 4.6875 and 2.34375 YOLO for halvings 1 to 5, then the
-  * 1.5 YOLO floor from height 6,307,200. Split on the normal path: treasury `reward * 4 / 100`, LP
-  * `reward * 3 / 100`, miner the residual. On the terminal path (box value at most the reward) the same split is
-  * taken on the box value, and the emission NFT is burned.
+  * arm); 37.5 YOLO for halvings <= 0, then 18.75 and 9.375 YOLO for halvings 1 and 2, then the 4.6875 YOLO tail
+  * (`MinReward`, equal to `InitialReward / 8`) from height 3,153,600 until the box is empty. Split on the normal
+  * path: treasury `reward * 4 / 100`, LP `reward * 3 / 100`, miner the residual. On the terminal path (box value at
+  * most the reward) the same split is taken on the box value, and the emission NFT is burned.
   *
   * The genesis emission box is created at height 0 and first spent at height 1, so heights 1 to h are paid by the
   * time the spend at height h is done.
@@ -39,9 +39,10 @@ class YoloEmissionRules(val genesisValue: Long) {
     * Height of the terminal emission spend: the first height h >= 1 at which the emission box value before the
     * spend is at most `rewardAtHeight(h)`. At that height the whole box value is split by `terminalSplit` and the
     * NFT burned; from the next height on there is no emission transaction. For the 177,291,250 YOLO genesis value
-    * it is 21,023,916, where the box holds a last 1.0 YOLO (less than the 1.5 YOLO reward).
+    * it is 26,258,941, where the box holds a last 1.5625 YOLO (less than the 4.6875 YOLO reward).
     *
-    * A Long, as for a large genesis value the tail can outrun the Int height range.
+    * A Long. With the 4.6875 YOLO tail it stays inside the Int height range for every positive Long genesis value:
+    * 1,956,089,509 at `Long.MaxValue`.
     */
   lazy val terminalHeight: Long = {
     // walk the arms: inside an arm the reward is a constant r, and the box holds `before - r * (h - start)` just
@@ -101,14 +102,14 @@ object YoloEmissionRules {
   /** emission.es `blocksPerHalving`: one 365-day year at 30 s blocks. */
   val BlocksPerHalving: Int = 1051200
 
-  /** emission.es `initialReward`: 75 YOLO. */
-  val InitialReward: Long = 75L * CoinsInOneYolo
+  /** emission.es `initialReward`: 37.5 YOLO. */
+  val InitialReward: Long = 37500000000L
 
-  /** emission.es `minReward`: the 1.5 YOLO tail floor. */
-  val MinReward: Long = 1500000000L
+  /** emission.es `minReward`: the 4.6875 YOLO tail reward (`InitialReward / 8`). */
+  val MinReward: Long = 4687500000L
 
-  /** Number of halving arms paid before the floor (halvings 0 to 5). */
-  val ExplicitArms: Int = 6
+  /** Number of halving arms paid before the tail (halvings 0 to 2). */
+  val ExplicitArms: Int = 3
 
   /** Treasury share, in percent of the amount split (emission.es `treasuryReward`). */
   val TreasuryPercent: Long = 4L
@@ -116,12 +117,12 @@ object YoloEmissionRules {
   /** LP share, in percent of the amount split (emission.es `lpReward`). */
   val LpPercent: Long = 3L
 
-  /** First height paid at the floor: 6 * 1,051,200 = 6,307,200. */
+  /** First height paid at the tail reward: 3 * 1,051,200 = 3,153,600. */
   val FloorStartHeight: Int = ExplicitArms * BlocksPerHalving
 
   /**
-    * Block reward at `height`, as emission.es `blockReward`: `halvings = height / BlocksPerHalving`, 75 YOLO for
-    * halvings <= 0, `InitialReward / 2^halvings` for halvings 1 to 5, then `MinReward`, never below `MinReward`.
+    * Block reward at `height`, as emission.es `blockReward`: `halvings = height / BlocksPerHalving`, 37.5 YOLO for
+    * halvings <= 0, `InitialReward / 2^halvings` for halvings 1 and 2, then `MinReward`, never below `MinReward`.
     */
   def rewardAtHeight(height: Long): Long = {
     val halvings = height / BlocksPerHalving
@@ -129,9 +130,6 @@ object YoloEmissionRules {
       if (halvings <= 0) InitialReward
       else if (halvings == 1) InitialReward / 2L
       else if (halvings == 2) InitialReward / 4L
-      else if (halvings == 3) InitialReward / 8L
-      else if (halvings == 4) InitialReward / 16L
-      else if (halvings == 5) InitialReward / 32L
       else MinReward
     if (computed > MinReward) computed else MinReward
   }
@@ -173,7 +171,9 @@ object YoloEmissionRules {
 
   /**
     * Sum of the rewards at heights 1 to `height` (0 for heights below 1), ignoring exhaustion of the box.
-    * No overflow for any Int height: the arms total under 2^58 and the tail under 2^62.
+    * The arms total 68,984,962.5 YOLO (under 2^56). The tail adds 4.6875 YOLO a block and passes `Long.MaxValue`
+    * after height 1,956,089,508, so for larger heights this throws `ArithmeticException`. `remainingAfter` only
+    * calls it below `terminalHeight`, where the sum is less than the genesis value.
     */
   def paidThrough(height: Long): Long = {
     if (height < 1) {

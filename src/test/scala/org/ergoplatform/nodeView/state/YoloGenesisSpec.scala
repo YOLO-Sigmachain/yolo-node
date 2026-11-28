@@ -289,16 +289,17 @@ class YoloGenesisSpec extends ErgoCorePropertyTest with TestFileUtils {
       "emissionTreeHex is not the pinned emission contract")
 
     // one non-key constant changed: the treasury fund floor (constant 22, Long 100 YOLO), an LP fund Int 720
-    // constant (24; signWindow is 720) set back to 10, and the emission tree's tail floor (constant 15, 1.5 YOLO)
+    // constant (24; signWindow is 720) set back to 10, and the emission tree's tail reward (constant 9, 4.6875 YOLO)
     val treasuryFloor = withConstant(e.treasuryFundTreeHex, 22, sigma.ast.LongConstant(99000000000L))
     refused(_.copy(treasuryFundTreeHex = treasuryFloor),
       "treasuryFundTreeHex is not the pinned treasury fund contract", "constant 22 is", "expected 0580a0b787e905")
     val lpConst = withConstant(e.lpFundTreeHex, 24, sigma.ast.IntConstant(10))
     refused(_.copy(lpFundTreeHex = lpConst), "lpFundTreeHex is not the pinned LP fund contract",
       "constant 24 is 0414, expected 04a00b")
-    val emissionFloor = withConstant(e.emissionTreeHex, 15, sigma.ast.LongConstant(1L))
+    YoloTreePins.Emission.constants(9) shouldBe "05c0cbacf622"
+    val emissionFloor = withConstant(e.emissionTreeHex, 9, sigma.ast.LongConstant(1L))
     refused(_.copy(emissionTreeHex = emissionFloor), "emissionTreeHex is not the pinned emission contract",
-      "constant 15 is")
+      "constant 9 is", "expected 05c0cbacf622")
     // an accumulation tree with another id at the id index: the id is checked by value
     refused(x => x.copy(lpAccumulationTreeHex = withConstant(x.lpAccumulationTreeHex, 3,
       sigma.ast.ByteArrayConstant(Array.fill(32)(7: Byte)))), "lpAccumulationTreeHex")
@@ -533,8 +534,8 @@ class YoloGenesisSpec extends ErgoCorePropertyTest with TestFileUtils {
     // the genesis value must not strand the emission box: the last box and the terminal outputs each hold at least
     // MinValueMax (10,000) nanocoins per byte. Executed counter-examples, refused:
     org.ergoplatform.settings.Parameters.MinValueMax shouldBe 10000
-    // a last box of 1 nano at 21,024,050
-    refused(_.copy(genesisValue = 177291450000000001L), "strands the emission box", "spent at height 21024050",
+    // a last box of 1 nano at 26,258,984
+    refused(_.copy(genesisValue = 177291450000000001L), "strands the emission box", "spent at height 26258984",
       "holds v = 1;", "the last emission box holds 1, below", "MinValueMax 10000 x")
     // a last box of 0.001 YOLO
     refused(_.copy(genesisValue = 177291450001000000L), "strands the emission box", "holds v = 1000000;",
@@ -542,9 +543,9 @@ class YoloGenesisSpec extends ErgoCorePropertyTest with TestFileUtils {
     // a 1 nano genesis box: terminal at height 1, every share below the bound
     refused(_.copy(genesisValue = 1L), "strands the emission box", "spent at height 1", "holds v = 1;",
       "the terminal treasury share holds 0", "the terminal LP share holds 0", "the terminal miner output holds 1")
-    // 75 YOLO + 1 nano: a 1 nano box at height 2
-    refused(_.copy(genesisValue = 75000000001L), "strands the emission box", "spent at height 2", "holds v = 1;")
-    // the devnet value (last box 1.0 YOLO) and the schedule supply (last box 1.5 YOLO) do not strand the box
+    // 37.5 YOLO + 1 nano: a 1 nano box at height 2
+    refused(_.copy(genesisValue = 37500000001L), "strands the emission box", "spent at height 2", "holds v = 1;")
+    // the devnet value (last box 1.5625 YOLO) and the schedule supply (last box 4.6875 YOLO) do not strand the box
     YoloGenesis.strandedEmissionError(e) shouldBe None
     e.genesisValue shouldBe 177291250000000000L
     YoloGenesis.strandedEmissionError(e.copy(genesisValue = 177291450000000000L)) shouldBe None
@@ -561,6 +562,11 @@ class YoloGenesisSpec extends ErgoCorePropertyTest with TestFileUtils {
     err shouldBe defined
     err.get should include("genesisStateDigestHex = 4915ac03b4350bd727dc01017e3f179d28e51a443b875f71f2e3d3390a1c427a03")
     err.get should include(s"""computed: genesisStateDigestHex = "$computed"""")
+    // the digest of the v1.4 devnet genesis (the emission tree before the v1.5 schedule): refused
+    computed should not be "650a702c5d1d56d38063c64de26b568c63cb99eb8b337d0058decfb7162814df03"
+    YoloGenesis.launchError(devnet.chainSettings.copy(
+      genesisStateDigestHex = "650a702c5d1d56d38063c64de26b568c63cb99eb8b337d0058decfb7162814df03")).get should
+      include(s"""computed: genesisStateDigestHex = "$computed"""")
     // a changed genesis box (another genesis value) with the devnet digest: refused
     refused(_.copy(genesisValue = 177291450000000000L), "is not the digest of the YOLO genesis boxes")
   }
@@ -632,8 +638,8 @@ class YoloGenesisSpec extends ErgoCorePropertyTest with TestFileUtils {
   property("the YOLO emission rules are reachable from the devnet chain settings") {
     val rules = devnet.chainSettings.yoloEmissionRulesOpt.get
     rules.genesisValue shouldBe 177291250000000000L
-    rules.terminalHeight shouldBe 21023916L
-    YoloEmissionRules.rewardAtHeight(1) shouldBe 75000000000L
+    rules.terminalHeight shouldBe 26258941L
+    YoloEmissionRules.rewardAtHeight(1) shouldBe 37500000000L
     devnet.launchParameters shouldBe YoloLaunchParameters
   }
 

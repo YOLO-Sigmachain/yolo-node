@@ -12,7 +12,7 @@ import sigma.interpreter.ProverResult
 
 /**
   * YOLO (SigmaChain) coinbase builder, with the 2880-block coinbase miner delay: the emission transaction the
-  * emission contract in the yolo-contracts repo (`01-emission-tests/emission.es` v1.4) accepts. Used by
+  * emission contract in the yolo-contracts repo (`01-emission-tests/emission.es` v1.5) accepts. Used by
   * `CandidateGenerator.collectRewards` in place of Ergo's emission transaction when `ergo.chain.yolo.enabled = true`.
   *
   * One input, the emission box, with an empty proof (the emission script needs no signature, as upstream). No data

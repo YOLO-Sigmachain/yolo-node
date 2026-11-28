@@ -132,22 +132,26 @@ class EmissionApiRouteSpec extends AnyFlatSpec
   it should "with the YOLO switch on, report the YOLO curve and split at the boundary heights" in {
     devnet.chainSettings.yolo.enabled shouldBe true
     val t = rules.terminalHeight
+    t shouldBe 26258941L
     t should be < Int.MaxValue.toLong
     val terminal = t.toInt
-    // first tail (floor) height, derived from the rules
+    // first tail height, derived from the rules
     val floor = YoloEmissionRules.FloorStartHeight
+    floor shouldBe 3153600
     YoloEmissionRules.rewardAtHeight(floor) shouldBe YoloEmissionRules.MinReward
     YoloEmissionRules.rewardAtHeight(floor - 1) should be > YoloEmissionRules.MinReward
     // the arm boundary: 1,051,200 is already in the second arm (halvings = height / BlocksPerHalving)
     val b = YoloEmissionRules.BlocksPerHalving
     YoloEmissionRules.rewardAtHeight(b - 1) shouldBe YoloEmissionRules.InitialReward
     YoloEmissionRules.rewardAtHeight(b) shouldBe YoloEmissionRules.InitialReward / 2
+    YoloEmissionRules.rewardAtHeight(2 * b - 1) shouldBe YoloEmissionRules.InitialReward / 2
+    YoloEmissionRules.rewardAtHeight(2 * b) shouldBe YoloEmissionRules.InitialReward / 4
     // the terminal spend pays less than or exactly a full reward, the spend before it a full reward
     rules.boxValueAt(t) should be <= YoloEmissionRules.rewardAtHeight(t)
     rules.boxValueAt(t - 1) should be > YoloEmissionRules.rewardAtHeight(t - 1)
 
-    val heights = Seq(0, 1, 2, b - 1, b, b + 1, floor - 1, floor, floor + 1, terminal - 1, terminal, terminal + 1,
-      Int.MaxValue)
+    val heights = Seq(0, 1, 2, b - 1, b, b + 1, 2 * b - 1, 2 * b, 2 * b + 1, floor - 1, floor, floor + 1,
+      terminal - 1, terminal, terminal + 1, Int.MaxValue)
     heights.foreach { h =>
       Get(s"$prefix/$h") ~> yoloRoute ~> check {
         status shouldBe StatusCodes.OK
@@ -157,22 +161,43 @@ class EmissionApiRouteSpec extends AnyFlatSpec
       }
     }
 
-    // spot values: 75 YOLO split 3.0 / 2.25 / 69.75 at height 1; 37.5 YOLO at the second arm
+    // spot values: 37.5 YOLO split 1.5 / 1.125 / 34.875 at height 1; 18.75 YOLO at the second arm, 9.375 at the
+    // third, the 4.6875 YOLO tail from 3,153,600
     Get(s"$prefix/1") ~> yoloRoute ~> check {
       val json = responseAs[Json]
-      long(json, "minerReward") shouldBe 69750000000L
-      long(json, "treasuryReward") shouldBe 3000000000L
-      long(json, "lpReward") shouldBe 2250000000L
-      long(json, "blockReward") shouldBe 75000000000L
-      long(json, "totalCoinsIssued") shouldBe 75000000000L
+      long(json, "minerReward") shouldBe 34875000000L
+      long(json, "treasuryReward") shouldBe 1500000000L
+      long(json, "lpReward") shouldBe 1125000000L
+      long(json, "blockReward") shouldBe 37500000000L
+      long(json, "totalCoinsIssued") shouldBe 37500000000L
     }
     Get(s"$prefix/$b") ~> yoloRoute ~> check {
-      long(responseAs[Json], "blockReward") shouldBe 37500000000L
+      long(responseAs[Json], "blockReward") shouldBe 18750000000L
+    }
+    Get(s"$prefix/${2 * b}") ~> yoloRoute ~> check {
+      long(responseAs[Json], "blockReward") shouldBe 9375000000L
+    }
+    Get(s"$prefix/$floor") ~> yoloRoute ~> check {
+      val json = responseAs[Json]
+      long(json, "blockReward") shouldBe 4687500000L
+      long(json, "treasuryReward") shouldBe 187500000L
+      long(json, "lpReward") shouldBe 140625000L
+      long(json, "minerReward") shouldBe 4359375000L
+    }
+    // the last normal spend leaves 1.5625 YOLO
+    Get(s"$prefix/${terminal - 1}") ~> yoloRoute ~> check {
+      val json = responseAs[Json]
+      long(json, "blockReward") shouldBe 4687500000L
+      long(json, "totalRemainCoins") shouldBe 1562500000L
     }
     // terminal: the whole remaining box goes out, everything is issued; after it all zeros
     Get(s"$prefix/$terminal") ~> yoloRoute ~> check {
       val json = responseAs[Json]
       long(json, "blockReward") shouldBe rules.boxValueAt(t)
+      long(json, "blockReward") shouldBe 1562500000L
+      long(json, "treasuryReward") shouldBe 62500000L
+      long(json, "lpReward") shouldBe 46875000L
+      long(json, "minerReward") shouldBe 1453125000L
       long(json, "totalCoinsIssued") shouldBe rules.genesisValue
       long(json, "totalRemainCoins") shouldBe 0L
     }
@@ -190,9 +215,9 @@ class EmissionApiRouteSpec extends AnyFlatSpec
   }
 
   it should "with the YOLO switch on, take the terminal split on the box value (small genesis value)" in {
-    // 235 YOLO: heights 1 to 3 pay 75 each, height 4 spends the last 10 YOLO, then nothing
+    // 122.5 YOLO: heights 1 to 3 pay 37.5 each, height 4 spends the last 10 YOLO, then nothing
     val coin = YoloEmissionRules.CoinsInOneYolo
-    val s = withGenesisValue(235L * coin)
+    val s = withGenesisValue(1225L * coin / 10)
     val r = s.chainSettings.yoloEmissionRulesOpt.get
     r.terminalHeight shouldBe 4L
     val smallRoute = EmissionApiRoute(s).route
